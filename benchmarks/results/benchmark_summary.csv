@@ -1,0 +1,4 @@
+algorithm,netlist_id,total_runs,success_count,success_rate,mean_hpwl,median_hpwl,min_hpwl,max_hpwl,std_hpwl,mean_runtime_sec,median_runtime_sec
+random,toy_4,3,3,100.00%,61.0000,62.5000,53.0000,67.5000,7.3655,0.005413,0.005361
+random,medium_8,3,3,100.00%,234.6667,236.7500,201.5000,265.7500,32.1756,0.014398,0.014425
+random,dense_10,3,3,100.00%,250.4167,245.0000,241.5000,264.7500,12.5358,0.015825,0.015779

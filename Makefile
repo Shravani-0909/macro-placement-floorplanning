@@ -1,8 +1,8 @@
 .PHONY: test lint
 
 test:
-	uv run pytest
+	uv run --frozen pytest
 
 lint:
-	uv run ruff check .
-	uv run mypy src tests
+	uv run --frozen ruff check .
+	uv run --frozen mypy src tests
