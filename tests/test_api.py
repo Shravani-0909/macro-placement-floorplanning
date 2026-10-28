@@ -271,3 +271,73 @@ async def test_websocket_progress_stream(valid_netlist_payload: dict[str, Any]) 
 
     assert len(messages) >= 1
     assert any(m["status"] in ("running", "completed") for m in messages)
+
+
+@async_test
+async def test_run_greedy_via_api(valid_netlist_payload: dict[str, Any]) -> None:
+    """POST /api/placements/run executes Greedy algorithm to completion."""
+    payload = {
+        "netlist": valid_netlist_payload,
+        "algorithm": "greedy",
+        "seed": 42,
+        "params": {"alpha": 1.0, "beta": 1.0},
+    }
+    status_code, start_body = await asgi_request("POST", "/api/placements/run", json_body=payload)
+    assert status_code == 202
+    run_id = start_body["run_id"]
+
+    for _ in range(50):
+        _, job = await asgi_request("GET", f"/api/placements/{run_id}")
+        if job.get("status") in ("completed", "failed"):
+            break
+        await asyncio.sleep(0.02)
+
+    assert job["status"] == "completed"
+    assert job["current_hpwl"] is not None
+    assert len(job["placement"]) == 3
+
+
+@async_test
+async def test_run_sa_via_api(valid_netlist_payload: dict[str, Any]) -> None:
+    """POST /api/placements/run executes SA algorithm to completion."""
+    payload = {
+        "netlist": valid_netlist_payload,
+        "algorithm": "sa",
+        "seed": 42,
+        "params": {"max_iterations": 10, "cooling_rate": 0.8},
+    }
+    status_code, start_body = await asgi_request("POST", "/api/placements/run", json_body=payload)
+    assert status_code == 202
+    run_id = start_body["run_id"]
+
+    for _ in range(50):
+        _, job = await asgi_request("GET", f"/api/placements/{run_id}")
+        if job.get("status") in ("completed", "failed"):
+            break
+        await asyncio.sleep(0.02)
+
+    assert job["status"] == "completed"
+    assert job["current_hpwl"] is not None
+    assert len(job["placement"]) == 3
+
+
+@async_test
+async def test_run_simulated_annealing_alias_via_api(valid_netlist_payload: dict[str, Any]) -> None:
+    """POST /api/placements/run executes with 'simulated_annealing' alias."""
+    payload = {
+        "netlist": valid_netlist_payload,
+        "algorithm": "simulated_annealing",
+        "seed": 42,
+        "params": {"max_iterations": 5},
+    }
+    status_code, start_body = await asgi_request("POST", "/api/placements/run", json_body=payload)
+    assert status_code == 202
+    run_id = start_body["run_id"]
+
+    for _ in range(50):
+        _, job = await asgi_request("GET", f"/api/placements/{run_id}")
+        if job.get("status") in ("completed", "failed"):
+            break
+        await asyncio.sleep(0.02)
+
+    assert job["status"] == "completed"

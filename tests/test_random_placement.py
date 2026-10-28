@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from src.placement.models import Macro, Net, Netlist, PlacedMacro, Placement
 from src.algorithms.random_placement import (
     PlacementResult,
     RandomPlacementResult,
@@ -256,25 +257,19 @@ def test_no_mutation_of_netlist(sample_netlist):
 
 
 def test_true_integration_with_shared_helper(sample_netlist):
-    """Integration test with Zoya's shared engine helper.
-
-    Skipped if src.placement.legal is not available yet.
-    """
-    try:
-        from src.placement.legal import random_legal_placement as shared_helper
-    except ImportError:
-        pytest.skip(
-            "Integration pending: Zoya's shared engine module 'src.placement.legal' is not yet implemented."
-        )
-
-    # If the helper is implemented, execute end-to-end integration
+    """Integration test with shared engine random placement."""
     result = random_placement(sample_netlist, seed=42)
     assert isinstance(result, RandomPlacementResult)
-    if result.success:
-        assert result.placement is not None
-        assert result.hpwl is not None
-        assert result.congestion is not None
-        assert result.objective is not None
+    assert result.success is True
+    assert result.placement is not None
+    assert result.hpwl is not None
+    assert result.congestion is not None
+    assert result.objective is not None
+
+    # Verify deterministic reproducibility with identical seed
+    result2 = random_placement(sample_netlist, seed=42)
+    assert result.placement == result2.placement
+    assert np.isclose(result.objective, result2.objective)
 
 
 # =============================================================================
@@ -349,3 +344,56 @@ def test_missing_shared_helper_raises_not_implemented(sample_netlist, monkeypatc
 
     with pytest.raises(NotImplementedError, match="Shared engine module"):
         random_placement(sample_netlist, seed=42)
+
+
+# =============================================================================
+# 11. Shared Engine Canonical Integration & Dead End Detection
+# =============================================================================
+
+
+def test_random_placement_with_canonical_netlist():
+    """Random placement works directly with canonical Netlist instances."""
+    macros = (Macro(id=1, w=2, h=2), Macro(id=2, w=1, h=1))
+    nets = (Net(id=10, macro_ids=(1, 2), weight=1.5),)
+    netlist = Netlist(version="1.0", grid_w=6, grid_h=6, macros=macros, nets=nets)
+
+    result = random_placement(netlist, seed=123)
+    assert result.success is True
+    assert result.placement is not None
+    assert len(result.placement) == 2
+    assert result.hpwl > 0.0
+    assert result.congestion >= 0.0
+    assert result.objective > 0.0
+
+
+def test_random_placement_dead_end_cannot_fit():
+    """When macros cannot legally fit within the grid, random placement detects dead end."""
+    # 2x2 grid with two 2x2 macros: second macro cannot be placed
+    macros = (Macro(id=1, w=2, h=2), Macro(id=2, w=2, h=2))
+    netlist = Netlist(version="1.0", grid_w=2, grid_h=2, macros=macros, nets=())
+
+    result = random_placement(netlist, seed=42)
+    assert result.success is False
+    assert result.placement is None
+    assert result.hpwl is None
+    assert result.congestion is None
+    assert result.objective is None
+
+
+def test_random_placement_placement_list_compatibility():
+    """Custom helper returning Placement (list[PlacedMacro]) is fully supported."""
+    sample = {
+        "grid_w": 5,
+        "grid_h": 5,
+        "macros": {1: (1, 1), 2: (1, 1)},
+        "nets": [{"pins": [1, 2], "weight": 1.0}],
+    }
+
+    def list_helper(nl, seed=42):
+        return [PlacedMacro(macro_id=1, x=0, y=0), PlacedMacro(macro_id=2, x=2, y=2)]
+
+    result = random_placement(sample, legal_placement_fn=list_helper)
+    assert result.success is True
+    assert isinstance(result.placement, list)
+    assert len(result.placement) == 2
+    assert result.hpwl == 4.0

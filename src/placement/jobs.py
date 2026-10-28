@@ -3,7 +3,10 @@
 import asyncio
 import random
 import uuid
-from collections.abc import Awaitable, Callable
+import numpy as np
+from collections.abc import Awaitable, Callable, Mapping
+from src.algorithms.greedy import greedy_placement
+from src.algorithms.simulated_annealing import simulated_annealing
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -96,6 +99,119 @@ async def default_random_placement_runner(
     return engine.get_placement()
 
 
+async def default_greedy_placement_runner(
+    netlist: Netlist,
+    seed: int,
+    params: dict[str, Any],
+    progress_cb: ProgressCallback,
+) -> Placement:
+    """Deterministic greedy placement algorithm runner.
+
+    Places macros sequentially at coordinates minimizing incremental wirelength.
+    """
+    alpha = float(params.get("alpha", 1.0))
+    beta = float(params.get("beta", 1.0))
+
+    result = greedy_placement(netlist, alpha=alpha, beta=beta)
+    if not result.success or result.placement is None:
+        raise PlacementError("Greedy placement failed to complete a legal placement.")
+
+    if isinstance(result.placement, list):
+        final_placement: Placement = result.placement
+    elif isinstance(result.placement, Mapping):
+        final_placement = [
+            PlacedMacro(macro_id=mid, x=coord[0], y=coord[1])
+            for mid, coord in result.placement.items()
+        ]
+    else:
+        final_placement = list(result.placement)
+
+    await progress_cb(
+        JobProgress(
+            run_id="",
+            status="running",
+            progress=1.0,
+            step=len(netlist.macros),
+            total_steps=len(netlist.macros),
+            current_hpwl=result.hpwl,
+            placement=final_placement,
+        )
+    )
+    await asyncio.sleep(0.001)
+
+    return final_placement
+
+
+async def default_sa_placement_runner(
+    netlist: Netlist,
+    seed: int,
+    params: dict[str, Any],
+    progress_cb: ProgressCallback,
+) -> Placement:
+    """Simulated Annealing algorithm runner.
+
+    Stochastically searches for optimal placement using thermal cooling schedule.
+    """
+    alpha = float(params.get("alpha", 1.0))
+    beta = float(params.get("beta", 1.0))
+    initial_placement = params.get("initial_placement", None)
+    initial_temperature = float(params.get("initial_temperature", 100.0))
+    cooling_rate = float(params.get("cooling_rate", 0.95))
+    min_temperature = float(params.get("min_temperature", 1e-3))
+    max_iterations = int(params.get("max_iterations", 1000))
+    shift_window = params.get("shift_window", None)
+    if shift_window is not None:
+        if (
+            isinstance(shift_window, bool)
+            or not isinstance(shift_window, (int, np.integer))
+            or shift_window <= 0
+        ):
+            raise ValueError(f"shift_window must be a positive integer, got {shift_window!r}.")
+        shift_window = int(shift_window)
+    move_weights = params.get("move_weights", None)
+
+    result = simulated_annealing(
+        netlist,
+        initial_placement=initial_placement,
+        alpha=alpha,
+        beta=beta,
+        initial_temperature=initial_temperature,
+        cooling_rate=cooling_rate,
+        min_temperature=min_temperature,
+        max_iterations=max_iterations,
+        seed=seed,
+        shift_window=shift_window,
+        move_weights=move_weights,
+    )
+    if not result.success or result.placement is None:
+        raise PlacementError("Simulated annealing failed to find a valid legal placement.")
+
+    if isinstance(result.placement, list):
+        final_placement: Placement = result.placement
+    elif isinstance(result.placement, Mapping):
+        final_placement = [
+            PlacedMacro(macro_id=mid, x=coord[0], y=coord[1])
+            for mid, coord in result.placement.items()
+        ]
+    else:
+        final_placement = list(result.placement)
+
+    await progress_cb(
+        JobProgress(
+            run_id="",
+            status="running",
+            progress=1.0,
+            step=len(netlist.macros),
+            total_steps=len(netlist.macros),
+            current_hpwl=result.hpwl,
+            placement=final_placement,
+        )
+    )
+    await asyncio.sleep(0.001)
+
+    return final_placement
+
+
 def register_algorithm(name: str, runner: AlgorithmRunner) -> None:
     """Register an algorithm runner with the engine registry.
 
@@ -116,8 +232,12 @@ def get_registered_algorithms() -> list[str]:
     return sorted(ALGORITHM_REGISTRY.keys())
 
 
-# Register default random algorithm runner
+
+# Register default placement algorithm runners
 register_algorithm("random", default_random_placement_runner)
+register_algorithm("greedy", default_greedy_placement_runner)
+register_algorithm("sa", default_sa_placement_runner)
+register_algorithm("simulated_annealing", default_sa_placement_runner)
 
 
 class JobManager:

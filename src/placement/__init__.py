@@ -31,6 +31,9 @@ from .hpwl import (
     get_macro_center,
 )
 from .jobs import (
+    default_greedy_placement_runner,
+    default_random_placement_runner,
+    default_sa_placement_runner,
     get_registered_algorithms,
     register_algorithm,
 )
@@ -47,6 +50,9 @@ __all__ = [
     "BenchmarkRunResult",
     "BenchmarkSummary",
     "DuplicateMacroError",
+    "default_greedy_placement_runner",
+    "default_random_placement_runner",
+    "default_sa_placement_runner",
     "IncompletePlacementError",
     "Macro",
     "Net",

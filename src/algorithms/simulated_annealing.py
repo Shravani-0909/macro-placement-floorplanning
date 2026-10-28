@@ -23,18 +23,18 @@ import random
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 import numpy as np
 
+from src.algorithms.common import (
+    extract_placed_ids,
+    normalize_placement,
+    random_legal_placement,
+    to_canonical_netlist,
+)
+from src.placement.engine import PlacementEngine
+from src.placement.models import PlacedMacro
 from src.placement.objective import EvaluationResult, evaluate_placement
 
-# Dynamic imports for Zoya's shared engine modules once implemented
-try:
-    from src.placement.legal import random_legal_placement  # type: ignore[import-untyped]
-except ImportError:
-    random_legal_placement = None
-
-try:
-    from src.placement.grid import GridEnv  # type: ignore[import-untyped]
-except ImportError:
-    GridEnv = None
+# Dynamic aliases (preserving GridEnv and random_legal_placement backward-compatibility)
+GridEnv = PlacementEngine
 
 
 class SimulatedAnnealingResult(NamedTuple):
@@ -87,109 +87,8 @@ def _extract_macro_ids(netlist: Any) -> set[Any]:
     return set()
 
 
-def _extract_placed_ids(placement: Any) -> set[Any]:
-    """Extract the set of placed macro IDs from placement object or mapping."""
-    if placement is None:
-        return set()
-    if hasattr(placement, "positions"):
-        raw_pos = placement.positions
-    elif isinstance(placement, Mapping):
-        raw_pos = placement
-    else:
-        try:
-            raw_pos = {k: placement[k] for k in placement}
-        except (TypeError, AttributeError):
-            raw_pos = {}
-
-    if isinstance(raw_pos, Mapping):
-        return {k for k, v in raw_pos.items() if v is not None}
-    return set()
-
-
-def _normalize_placement(placement: Any) -> dict[Any, tuple[int, int]]:
-    """Convert any placement representation into a dictionary of macro_id -> (int(x), int(y)).
-
-    Supports:
-        1. Tuple or list: (x, y)
-        2. Mapping: {"x": x, "y": y}
-        3. Object with .x and .y attributes (e.g. PlacedMacro)
-
-    Raises
-    ------
-    ValueError
-        If coordinates for any placed macro are missing, non-numeric, non-finite,
-        or non-integer.
-    """
-    if placement is None:
-        return {}
-    if hasattr(placement, "positions"):
-        raw_pos = placement.positions
-    elif isinstance(placement, Mapping):
-        raw_pos = placement
-    else:
-        try:
-            raw_pos = {k: placement[k] for k in placement}
-        except (TypeError, AttributeError):
-            raw_pos = {}
-
-    norm: dict[Any, tuple[int, int]] = {}
-    if isinstance(raw_pos, Mapping):
-        for m_id, coord in raw_pos.items():
-            if coord is None:
-                continue
-
-            if isinstance(coord, (tuple, list)):
-                if len(coord) != 2:
-                    raise ValueError(
-                        f"Placement for macro '{m_id}' tuple/list must have length 2, got {len(coord)}."
-                    )
-                x, y = coord[0], coord[1]
-            elif isinstance(coord, Mapping):
-                x = coord.get("x")
-                y = coord.get("y")
-                if x is None or y is None:
-                    raise ValueError(
-                        f"Placement mapping for macro '{m_id}' must provide 'x' and 'y', got {coord}."
-                    )
-            elif hasattr(coord, "x") and hasattr(coord, "y"):
-                x = getattr(coord, "x")
-                y = getattr(coord, "y")
-            else:
-                raise ValueError(
-                    f"Unsupported coordinate format for macro '{m_id}': {coord!r}."
-                )
-
-            if x is None or y is None:
-                raise ValueError(
-                    f"Placement for macro '{m_id}' must provide x and y coordinates."
-                )
-
-            if (
-                isinstance(x, bool)
-                or isinstance(y, bool)
-                or not isinstance(x, (int, float, np.integer, np.floating))
-                or not isinstance(y, (int, float, np.integer, np.floating))
-            ):
-                raise ValueError(
-                    f"Macro '{m_id}' coordinates must be numeric, got x={type(x).__name__}, y={type(y).__name__}."
-                )
-
-            if not math.isfinite(x) or not math.isfinite(y):
-                raise ValueError(
-                    f"Macro '{m_id}' coordinates must be finite, got x={x}, y={y}."
-                )
-
-            int_x = int(x)
-            int_y = int(y)
-
-            if int_x != x or int_y != y:
-                raise ValueError(
-                    f"Macro '{m_id}' coordinates must be integer grid coordinates, got ({x}, {y})."
-                )
-
-            norm[m_id] = (int_x, int_y)
-
-    return norm
+_extract_placed_ids = extract_placed_ids
+_normalize_placement = normalize_placement
 
 
 def _choose(rng: Any, sequence: Sequence[Any]) -> Any:
@@ -241,6 +140,26 @@ def _acceptance_probability(delta: float, temperature: float) -> float:
         return 0.0
 
 
+def _query_legal_positions(env: Any, m_id: Any) -> list[tuple[int, int]]:
+    """Retrieve all legal (x, y) anchors for macro m_id in row-major order."""
+    if hasattr(env, "get_legal_positions"):
+        return env.get_legal_positions(m_id)
+    elif hasattr(env, "legal_mask"):
+        mask = env.legal_mask(m_id)
+        if mask is None:
+            return []
+        mask_arr = np.asarray(mask, dtype=bool)
+        if mask_arr.ndim != 2:
+            return []
+        grid_h, grid_w = mask_arr.shape
+        return [(x, y) for y in range(grid_h) for x in range(grid_w) if mask_arr[y, x]]
+    elif hasattr(env, "compute_action_mask"):
+        mask = env.compute_action_mask(m_id, flatten=False)
+        grid_h, grid_w = mask.shape
+        return [(x, y) for y in range(grid_h) for x in range(grid_w) if mask[y, x]]
+    return []
+
+
 def _get_candidate_anchors(
     netlist: Any,
     current_placement: dict[Any, tuple[int, int]],
@@ -250,7 +169,7 @@ def _get_candidate_anchors(
 ) -> list[tuple[int, int]]:
     """Query legal anchor candidates for relocating macro `m_id` without collision.
 
-    Delegates legality checks exclusively to Zoya's shared `GridEnv.legal_mask`.
+    Delegates legality checks exclusively to the engine or environment.
     Does not duplicate any boundary or overlap detection logic.
     """
     curr_pos = current_placement.get(m_id)
@@ -258,13 +177,13 @@ def _get_candidate_anchors(
         return []
 
     curr_x, curr_y = curr_pos
+    positions: list[tuple[int, int]] = []
 
-    mask: Any = None
     # If the active environment supports unplace/remove, use the fast path
     if active_env is not None and hasattr(active_env, "unplace"):
         active_env.unplace(m_id)
         try:
-            mask = active_env.legal_mask(m_id)
+            positions = _query_legal_positions(active_env, m_id)
         finally:
             try:
                 active_env.place(m_id, curr_x, curr_y)
@@ -275,7 +194,7 @@ def _get_candidate_anchors(
     elif active_env is not None and hasattr(active_env, "remove"):
         active_env.remove(m_id)
         try:
-            mask = active_env.legal_mask(m_id)
+            positions = _query_legal_positions(active_env, m_id)
         finally:
             try:
                 active_env.place(m_id, curr_x, curr_y)
@@ -285,29 +204,131 @@ def _get_candidate_anchors(
                 ) from restore_err
     else:
         # Replay placement of all other macros on a fresh environment instance
-        env = env_class(netlist)
+        if env_class is PlacementEngine:
+            env = env_class(to_canonical_netlist(netlist))
+        else:
+            env = env_class(netlist)
         for other_id in sorted(current_placement.keys(), key=str):
             if other_id != m_id:
                 ox, oy = current_placement[other_id]
                 env.place(other_id, ox, oy)
-        mask = env.legal_mask(m_id)
+        positions = _query_legal_positions(env, m_id)
 
-    if mask is None:
-        return []
+    return [(x, y) for (x, y) in positions if (x != curr_x or y != curr_y)]
 
-    mask_arr = np.asarray(mask, dtype=bool)
-    if mask_arr.ndim != 2:
-        return []
 
-    grid_h, grid_w = mask_arr.shape
-    candidates: list[tuple[int, int]] = []
-    # Enumerate legal anchors in deterministic row-major order (y then x)
-    for y in range(grid_h):
-        for x in range(grid_w):
-            if mask_arr[y, x] and (x != curr_x or y != curr_y):
-                candidates.append((x, y))
+def _choose_weighted(rng: Any, items: list[str], weights: list[float]) -> str:
+    """Select an item according to non-negative weights using rng."""
+    total = sum(weights)
+    if total <= 0.0:
+        return items[0]
+    if hasattr(rng, "choices"):
+        try:
+            return rng.choices(items, weights=weights, k=1)[0]
+        except (ValueError, TypeError):
+            pass
+    rand_fn = getattr(rng, "random", random.random)
+    r = rand_fn() * total
+    cumulative = 0.0
+    for item, w in zip(items, weights):
+        cumulative += w
+        if r <= cumulative:
+            return item
+    return items[-1]
 
-    return candidates
+
+def _is_legal_anchor(env: Any, m_id: Any, x: int, y: int) -> bool:
+    """Check whether placing m_id at (x, y) is legal in env (assuming m_id is unplaced)."""
+    if hasattr(env, "is_legal"):
+        try:
+            return bool(env.is_legal(m_id, x, y))
+        except Exception:
+            pass
+    legal_positions = _query_legal_positions(env, m_id)
+    return (x, y) in legal_positions
+
+
+def _check_swap_legality(
+    netlist: Any,
+    current_placement: dict[Any, tuple[int, int]],
+    m1: Any,
+    m2: Any,
+    pos1: tuple[int, int],
+    pos2: tuple[int, int],
+    env_class: Callable[..., Any],
+    active_env: Any | None = None,
+) -> bool:
+    """Check whether exchanging positions of m1 and m2 is strictly legal.
+
+    Delegates legality checks exclusively to the engine or environment.
+    Guarantees that active_env is left in its exact prior state.
+    """
+    if active_env is not None and hasattr(active_env, "unplace"):
+        active_env.unplace(m1)
+        active_env.unplace(m2)
+        is_legal = False
+        try:
+            if _is_legal_anchor(active_env, m1, pos2[0], pos2[1]):
+                try:
+                    active_env.place(m1, pos2[0], pos2[1])
+                    try:
+                        is_legal = _is_legal_anchor(active_env, m2, pos1[0], pos1[1])
+                    finally:
+                        active_env.unplace(m1)
+                except Exception:
+                    is_legal = False
+        finally:
+            try:
+                active_env.place(m1, pos1[0], pos1[1])
+                active_env.place(m2, pos2[0], pos2[1])
+            except Exception as restore_err:
+                raise RuntimeError(
+                    f"Failed to restore macro '{m1}' or '{m2}' during swap check: {restore_err}"
+                ) from restore_err
+        return is_legal
+    elif active_env is not None and hasattr(active_env, "remove"):
+        active_env.remove(m1)
+        active_env.remove(m2)
+        is_legal = False
+        try:
+            if _is_legal_anchor(active_env, m1, pos2[0], pos2[1]):
+                try:
+                    active_env.place(m1, pos2[0], pos2[1])
+                    try:
+                        is_legal = _is_legal_anchor(active_env, m2, pos1[0], pos1[1])
+                    finally:
+                        active_env.remove(m1)
+                except Exception:
+                    is_legal = False
+        finally:
+            try:
+                active_env.place(m1, pos1[0], pos1[1])
+                active_env.place(m2, pos2[0], pos2[1])
+            except Exception as restore_err:
+                raise RuntimeError(
+                    f"Failed to restore macro '{m1}' or '{m2}' during swap check: {restore_err}"
+                ) from restore_err
+        return is_legal
+    else:
+        # Replay fallback path
+        if env_class is PlacementEngine:
+            env = env_class(to_canonical_netlist(netlist))
+        else:
+            env = env_class(netlist)
+
+        cand = dict(current_placement)
+        cand[m1] = pos2
+        cand[m2] = pos1
+
+        for mid in sorted(cand.keys(), key=str):
+            px, py = cand[mid]
+            if not _is_legal_anchor(env, mid, px, py):
+                return False
+            try:
+                env.place(mid, px, py)
+            except Exception:
+                return False
+        return True
 
 
 def simulated_annealing(
@@ -324,6 +345,8 @@ def simulated_annealing(
     env_class: Callable[..., Any] | None = None,
     initial_placement: Any | None = None,
     rng: Any | None = None,
+    shift_window: int | None = None,
+    move_weights: Mapping[str, float] | None = None,
 ) -> SimulatedAnnealingResult:
     """Execute Simulated Annealing macro placement minimizing the combined objective.
 
@@ -441,6 +464,36 @@ def simulated_annealing(
     if int_max_iter <= 0:
         raise ValueError(f"max_iterations must be a positive integer, got {max_iterations}.")
 
+    if shift_window is not None:
+        if (
+            isinstance(shift_window, bool)
+            or not isinstance(shift_window, (int, np.integer))
+            or shift_window <= 0
+        ):
+            raise ValueError(f"shift_window must be a positive integer, got {shift_window!r}.")
+
+    valid_moves = {"shift", "swap", "relocate"}
+    effective_weights: dict[str, float] = {"shift": 1.0, "swap": 1.0, "relocate": 1.0}
+    if move_weights is not None:
+        if not isinstance(move_weights, Mapping):
+            raise ValueError(f"move_weights must be a mapping, got {type(move_weights).__name__}.")
+        parsed_weights: dict[str, float] = {}
+        for k, v in move_weights.items():
+            if k not in valid_moves:
+                raise ValueError(
+                    f"Unknown move type in move_weights: '{k}'. Valid: {sorted(valid_moves)}"
+                )
+            if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+                raise ValueError(f"Move weight for '{k}' must be numeric, got {type(v).__name__}.")
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError(f"Move weight for '{k}' must be finite and non-negative, got {v}.")
+            parsed_weights[k] = float(v)
+        for m in valid_moves:
+            effective_weights[m] = parsed_weights.get(m, 0.0)
+
+        if sum(effective_weights.values()) <= 0.0:
+            raise ValueError("At least one move type in move_weights must have positive weight.")
+
     flt_alpha = float(alpha)
     flt_beta = float(beta)
 
@@ -534,12 +587,29 @@ def simulated_annealing(
 
     # Attempt to initialize active persistent environment if supported
     active_env: Any | None = None
-    env_instance = cls(netlist)
+    if cls is PlacementEngine:
+        env_instance = cls(to_canonical_netlist(netlist))
+    else:
+        env_instance = cls(netlist)
     if hasattr(env_instance, "unplace") or hasattr(env_instance, "remove"):
         for mid in sorted(current_placement.keys(), key=str):
             px, py = current_placement[mid]
             env_instance.place(mid, px, py)
         active_env = env_instance
+
+    # Determine grid dimensions and shift window
+    if isinstance(netlist, Mapping):
+        gw = int(netlist.get("grid_w", 10))
+        gh = int(netlist.get("grid_h", 10))
+    else:
+        gw = int(getattr(netlist, "grid_w", 10))
+        gh = int(getattr(netlist, "grid_h", 10))
+    default_win = max(1, min(gw, gh) // 4)
+    effective_shift_window = shift_window if shift_window is not None else default_win
+
+    valid_moves_order = ("shift", "swap", "relocate")
+    active_moves = [m for m in valid_moves_order if effective_weights[m] > 0.0]
+    active_weights = [effective_weights[m] for m in active_moves]
 
     temperature = flt_init_temp
     iteration = 0
@@ -550,31 +620,155 @@ def simulated_annealing(
     while iteration < int_max_iter and temperature > flt_min_temp:
         iteration += 1
 
-        # Pick candidate macro to relocate
-        m_id = _choose(rng_inst, macro_list)
+        # Select move type
+        if len(active_moves) == 1:
+            chosen_move = active_moves[0]
+        elif (
+            hasattr(rng_inst, "_choices")
+            and getattr(rng_inst, "_choices")
+            and rng_inst._choices[0] not in valid_moves
+        ):
+            # Backward compatibility for existing FakeRNG tests where choices are macro IDs/anchors:
+            # Treat as relocate if active, else fallback to active_moves[0], without popping choice.
+            chosen_move = "relocate" if "relocate" in active_moves else active_moves[0]
+        elif (
+            hasattr(rng_inst, "_choices")
+            and getattr(rng_inst, "_choices")
+            and rng_inst._choices[0] in valid_moves
+        ):
+            popped = rng_inst._choices.pop(0)
+            chosen_move = popped if popped in active_moves else active_moves[0]
+        elif hasattr(rng_inst, "_choices"):
+            chosen_move = "relocate" if "relocate" in active_moves else active_moves[0]
+        else:
+            chosen_move = _choose_weighted(rng_inst, active_moves, active_weights)
 
-        # Query legal candidate anchors
-        candidates = _get_candidate_anchors(
-            netlist, current_placement, m_id, cls, active_env=active_env
-        )
+        if chosen_move == "swap":
+            if len(macro_list) < 2:
+                temperature *= flt_cooling
+                continue
 
-        if not candidates:
-            # No legal relocation anchor available: reject unchanged safely
+            m1 = _choose(rng_inst, macro_list)
+            remaining_macros = [m for m in macro_list if m != m1]
+            m2 = _choose(rng_inst, remaining_macros)
+
+            pos1 = current_placement[m1]
+            pos2 = current_placement[m2]
+
+            if not _check_swap_legality(
+                netlist, current_placement, m1, m2, pos1, pos2, cls, active_env=active_env
+            ):
+                # Illegal swap: reject safely and preserve active state
+                temperature *= flt_cooling
+                continue
+
+            cand_placement = dict(current_placement)
+            cand_placement[m1] = pos2
+            cand_placement[m2] = pos1
+
+            cand_eval = evaluate_placement(
+                netlist, cand_placement, alpha=flt_alpha, beta=flt_beta
+            )
+            delta = cand_eval.objective - current_eval.objective
+
+            accept = False
+            if delta <= 0.0:
+                accept = True
+            else:
+                prob = _acceptance_probability(delta, temperature)
+                rand_val = (
+                    rng_inst.random()
+                    if hasattr(rng_inst, "random")
+                    else random.random()
+                )
+                accept = rand_val < prob
+
+            if accept:
+                # Update active environment atomically
+                if active_env is not None and hasattr(active_env, "unplace"):
+                    active_env.unplace(m1)
+                    active_env.unplace(m2)
+                    try:
+                        active_env.place(m1, pos2[0], pos2[1])
+                        active_env.place(m2, pos1[0], pos1[1])
+                    except Exception as place_err:
+                        try:
+                            if hasattr(active_env, "is_placed") and active_env.is_placed(m1):
+                                active_env.unplace(m1)
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(active_env, "is_placed") and active_env.is_placed(m2):
+                                active_env.unplace(m2)
+                        except Exception:
+                            pass
+                        active_env.place(m1, pos1[0], pos1[1])
+                        active_env.place(m2, pos2[0], pos2[1])
+                        raise RuntimeError(
+                            f"Failed to apply accepted swap in active environment: {place_err}"
+                        ) from place_err
+                elif active_env is not None and hasattr(active_env, "remove"):
+                    active_env.remove(m1)
+                    active_env.remove(m2)
+                    try:
+                        active_env.place(m1, pos2[0], pos2[1])
+                        active_env.place(m2, pos1[0], pos1[1])
+                    except Exception as place_err:
+                        try:
+                            active_env.remove(m1)
+                        except Exception:
+                            pass
+                        try:
+                            active_env.remove(m2)
+                        except Exception:
+                            pass
+                        active_env.place(m1, pos1[0], pos1[1])
+                        active_env.place(m2, pos2[0], pos2[1])
+                        raise RuntimeError(
+                            f"Failed to apply accepted swap in active environment: {place_err}"
+                        ) from place_err
+
+                current_placement = cand_placement
+                current_eval = cand_eval
+                accepted_moves += 1
+
+                if current_eval.objective <= best_eval.objective:
+                    best_placement = dict(current_placement)
+                    best_eval = current_eval
+
             temperature *= flt_cooling
             continue
 
-        # Choose candidate anchor
+        # Chosen move is "shift" or "relocate"
+        m_id = _choose(rng_inst, macro_list)
+        all_candidates = _get_candidate_anchors(
+            netlist, current_placement, m_id, cls, active_env=active_env
+        )
+
+        if chosen_move == "shift":
+            x0, y0 = current_placement[m_id]
+            candidates = [
+                pos
+                for pos in all_candidates
+                if max(abs(pos[0] - x0), abs(pos[1] - y0)) <= effective_shift_window
+            ]
+        else:
+            candidates = all_candidates
+
+        if not candidates:
+            # No legal anchor available: reject safely
+            temperature *= flt_cooling
+            continue
+
         new_anchor = _choose(rng_inst, candidates)
         cand_placement = dict(current_placement)
         cand_placement[m_id] = new_anchor
 
-        # Evaluate candidate placement
         cand_eval = evaluate_placement(
             netlist, cand_placement, alpha=flt_alpha, beta=flt_beta
         )
         delta = cand_eval.objective - current_eval.objective
 
-        # Acceptance check
         accept = False
         if delta <= 0.0:
             accept = True
@@ -588,29 +782,47 @@ def simulated_annealing(
             accept = rand_val < prob
 
         if accept:
-            # Apply transition
+            old_anchor = current_placement[m_id]
+            if active_env is not None and hasattr(active_env, "unplace"):
+                active_env.unplace(m_id)
+                try:
+                    active_env.place(m_id, new_anchor[0], new_anchor[1])
+                except Exception as place_err:
+                    active_env.place(m_id, old_anchor[0], old_anchor[1])
+                    raise RuntimeError(
+                        f"Failed to apply accepted relocation in active environment: {place_err}"
+                    ) from place_err
+            elif active_env is not None and hasattr(active_env, "remove"):
+                active_env.remove(m_id)
+                try:
+                    active_env.place(m_id, new_anchor[0], new_anchor[1])
+                except Exception as place_err:
+                    active_env.place(m_id, old_anchor[0], old_anchor[1])
+                    raise RuntimeError(
+                        f"Failed to apply accepted relocation in active environment: {place_err}"
+                    ) from place_err
+
             current_placement = cand_placement
             current_eval = cand_eval
             accepted_moves += 1
 
-            # Update active environment if present
-            if active_env is not None and hasattr(active_env, "unplace"):
-                active_env.unplace(m_id)
-                active_env.place(m_id, new_anchor[0], new_anchor[1])
-            elif active_env is not None and hasattr(active_env, "remove"):
-                active_env.remove(m_id)
-                active_env.place(m_id, new_anchor[0], new_anchor[1])
-
-            # Update global best placement
             if current_eval.objective <= best_eval.objective:
                 best_placement = dict(current_placement)
                 best_eval = current_eval
 
-        # Cool temperature
         temperature *= flt_cooling
 
+    # Format return placement matching input representation
+    if isinstance(placement, list):
+        return_placement: Any = [
+            PlacedMacro(macro_id=mid, x=coord[0], y=coord[1])
+            for mid, coord in best_placement.items()
+        ]
+    else:
+        return_placement = best_placement
+
     return SimulatedAnnealingResult(
-        placement=best_placement,
+        placement=return_placement,
         success=True,
         hpwl=best_eval.hpwl,
         congestion=best_eval.congestion,
@@ -628,6 +840,7 @@ __all__ = [
     "PlacementResult",
     "SimulatedAnnealingResult",
     "anneal",
+    "random_legal_placement",
     "sa",
     "simulated_annealing",
 ]

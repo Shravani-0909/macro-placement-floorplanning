@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from src.placement.models import Macro, Net, Netlist, PlacedMacro, Placement
 from src.algorithms.greedy import (
     GreedyPlacementResult,
     PlacementResult,
@@ -372,6 +373,94 @@ def test_evaluator_exception_propagates(sample_netlist, monkeypatch):
         greedy_placement(sample_netlist, env_class=MockGridEnv)
 
 
+def test_fallback_removes_macro_and_propagates_on_hpwl_exception(sample_netlist):
+    """When hpwl_delta_move is unavailable and current_hpwl() raises, the temporary
+    placement is removed cleanly and the original exception propagates without leakage."""
+    created_env = None
+
+    class InstrumentedFallbackEnv:
+        def __init__(self, netlist: Any):
+            nonlocal created_env
+            self.netlist = netlist
+            self.placed: dict[Any, tuple[int, int]] = {}
+            self.history: list[tuple[str, Any]] = []
+            created_env = self
+
+        def legal_mask(self, macro_id: Any) -> np.ndarray:
+            return np.ones((5, 5), dtype=bool)
+
+        def place(self, macro_id: Any, x: int, y: int) -> None:
+            self.history.append(("place", macro_id, x, y))
+            self.placed[macro_id] = (x, y)
+
+        def unplace(self, macro_id: Any) -> None:
+            self.history.append(("unplace", macro_id))
+            self.placed.pop(macro_id, None)
+
+        def current_hpwl(self, allow_incomplete: bool = True) -> float:
+            self.history.append(("current_hpwl", allow_incomplete))
+            raise RuntimeError("Intentional error during current_hpwl() calculation.")
+
+        def placement(self) -> dict[Any, tuple[int, int]]:
+            return dict(self.placed)
+
+    assert not hasattr(InstrumentedFallbackEnv, "hpwl_delta_move")
+
+    with pytest.raises(RuntimeError, match="Intentional error during current_hpwl"):
+        greedy_placement(sample_netlist, env_class=InstrumentedFallbackEnv)
+
+    assert created_env is not None
+    # 1. Candidate evaluation placed a macro temporarily
+    place_calls = [item for item in created_env.history if item[0] == "place"]
+    assert len(place_calls) >= 1
+    macro_id = place_calls[0][1]
+
+    # 2. current_hpwl() was called and raised intentional exception
+    hpwl_calls = [item for item in created_env.history if item[0] == "current_hpwl"]
+    assert len(hpwl_calls) >= 1
+
+    # 3. The temporary macro was removed
+    unplace_calls = [item for item in created_env.history if item[0] == "unplace"]
+    assert len(unplace_calls) >= 1
+    assert unplace_calls[0][1] == macro_id
+
+    # Verify event order: place -> current_hpwl -> unplace
+    event_types = [item[0] for item in created_env.history]
+    assert event_types.index("place") < event_types.index("current_hpwl") < event_types.index("unplace")
+
+    # 4. The original exception propagates when cleanup succeeds (verified by pytest.raises)
+    # 5. The environment has no leaked temporary placement afterward
+    assert len(created_env.placed) == 0
+    assert created_env.placement() == {}
+
+
+def test_fallback_reports_cleanup_failure_when_unplace_fails(sample_netlist):
+    """When current_hpwl() fails and unplace cleanup also fails, report cleanup failure clearly."""
+    class FailingCleanupEnv:
+        def __init__(self, netlist: Any):
+            self.placed: dict[Any, tuple[int, int]] = {}
+
+        def legal_mask(self, macro_id: Any) -> np.ndarray:
+            return np.ones((5, 5), dtype=bool)
+
+        def place(self, macro_id: Any, x: int, y: int) -> None:
+            self.placed[macro_id] = (x, y)
+
+        def unplace(self, macro_id: Any) -> None:
+            raise IOError("Underlying hardware error during unplace.")
+
+        def current_hpwl(self, allow_incomplete: bool = True) -> float:
+            raise RuntimeError("Primary HPWL error.")
+
+        def placement(self) -> dict[Any, tuple[int, int]]:
+            return dict(self.placed)
+
+    assert not hasattr(FailingCleanupEnv, "hpwl_delta_move")
+
+    with pytest.raises(RuntimeError, match="Failed to unplace temporary macro '1' from \\(0, 0\\)"):
+        greedy_placement(sample_netlist, env_class=FailingCleanupEnv)
+
+
 # =============================================================================
 # 8. No Mutation of Input Netlist
 # =============================================================================
@@ -392,24 +481,14 @@ def test_no_mutation_of_netlist(sample_netlist):
 
 
 def test_true_integration_with_shared_grid_env(sample_netlist):
-    """Integration test with Zoya's shared GridEnv.
-
-    Skipped if src.placement.grid.GridEnv is not available yet.
-    """
-    try:
-        from src.placement.grid import GridEnv as SharedGridEnv
-    except ImportError:
-        pytest.skip(
-            "Integration pending: Zoya's shared engine module 'src.placement.grid.GridEnv' is not yet implemented."
-        )
-
+    """Integration test with shared engine PlacementEngine."""
     result = greedy_placement(sample_netlist)
     assert isinstance(result, GreedyPlacementResult)
-    if result.success:
-        assert result.placement is not None
-        assert result.hpwl is not None
-        assert result.congestion is not None
-        assert result.objective is not None
+    assert result.success is True
+    assert result.placement is not None
+    assert result.hpwl is not None
+    assert result.congestion is not None
+    assert result.objective is not None
 
 
 # =============================================================================
@@ -465,3 +544,49 @@ def test_missing_shared_grid_env_raises_not_implemented(sample_netlist, monkeypa
 
     with pytest.raises(NotImplementedError, match="Shared engine module"):
         greedy_placement(sample_netlist)
+
+
+# =============================================================================
+# 13. Shared Engine Canonical Integration & Dead End Detection
+# =============================================================================
+
+
+def test_greedy_placement_canonical_netlist():
+    """Greedy placement works directly with canonical Netlist instances."""
+    macros = (
+        Macro(id=1, w=3, h=2),  # Area 6
+        Macro(id=2, w=2, h=2),  # Area 4
+        Macro(id=3, w=1, h=1),  # Area 1
+    )
+    nets = (
+        Net(id=1, macro_ids=(1, 2), weight=2.0),
+        Net(id=2, macro_ids=(2, 3), weight=1.0),
+    )
+    netlist = Netlist(version="1.0", grid_w=8, grid_h=8, macros=macros, nets=nets)
+
+    result = greedy_placement(netlist, alpha=1.0, beta=1.0)
+    assert result.success is True
+    assert result.placement is not None
+    assert len(result.placement) == 3
+    assert result.hpwl > 0.0
+    assert result.congestion >= 0.0
+    assert result.objective > 0.0
+
+
+def test_greedy_placement_dead_end_detection():
+    """Greedy placement terminates cleanly and reports failure on oversubscribed grid."""
+    # 3x3 grid with two 3x2 macros: second macro cannot fit legally
+    macros = (
+        Macro(id=1, w=3, h=2),
+        Macro(id=2, w=3, h=2),
+    )
+    netlist = Netlist(version="1.0", grid_w=3, grid_h=3, macros=macros, nets=())
+
+    result = greedy_placement(netlist)
+    assert result.success is False
+    assert result.hpwl is None
+    assert result.congestion is None
+    assert result.objective is None
+    # Placed only first macro before reaching dead end
+    assert result.placement is not None
+    assert len(result.placement) == 1

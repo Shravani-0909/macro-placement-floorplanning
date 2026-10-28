@@ -1,27 +1,20 @@
 """RUDY Congestion Estimation and Combined Placement Objective.
 
 ===============================================================================
-Module-Level Integration Note (Future Shared Engine Integration)
+Module-Level Integration Note (Shared Engine Integration)
 ===============================================================================
-This module is designed to operate independently while Zoya's shared placement
-engine is under development. In the future, once the following shared engine
-modules are available:
-    - `src.placement.models` (`Netlist`, `Placement`, `Macro`, `Net`)
-    - `src.placement.hpwl` (`hpwl(netlist, placement)`)
-    - `src.placement.grid` / geometry (`pin_positions(...)`, `net_bbox(...)`)
+This module integrates directly with the shared placement engine:
+    - `src.placement.models` (`Netlist`, `Placement`, `Macro`, `Net`, `PlacedMacro`)
+    - `src.placement.hpwl` (`calculate_hpwl`, `get_macro_center`)
 
-This module's temporary internal adapter helpers:
-    - `_extract_grid_dimensions(netlist)`
-    - `_extract_macros(netlist)`
-    - `_extract_nets(netlist)`
-    - `_extract_placements(placement)`
-    - `_calculate_pin_center(macro_pos, macro_dim)`
-    - `_get_placed_net_pin_centers(net, macros, placements)`
-    - `_calculate_hpwl(netlist, placement)`
-
-can be directly substituted by imports or a thin shim delegating to the shared
-engine's `pin_positions`, `net_bbox`, and `hpwl` functions, preserving the public
-API (`rudy_map`, `congestion_score`, `evaluate_placement`, `EvaluationResult`).
+Extraction helpers accept both canonical engine models (e.g. `list[PlacedMacro]`
+placements and `Netlist` instances) and duck-typed/dictionary data structures,
+preserving full backward compatibility while delegating wirelength and geometry
+to the canonical engine implementations. Public APIs:
+    - `rudy_map(netlist, placement)`
+    - `congestion_score(netlist, placement)`
+    - `evaluate_placement(netlist, placement, alpha, beta)`
+    - `EvaluationResult`
 
 ===============================================================================
 Algorithmic & Mathematical Specification
@@ -86,6 +79,9 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping, NamedTuple, Sequence
 import numpy as np
+
+from src.placement.hpwl import calculate_hpwl, get_macro_center
+from src.placement.models import Netlist, PlacedMacro, Placement, placement_to_dict
 
 
 class EvaluationResult(NamedTuple):
@@ -271,29 +267,71 @@ def _extract_placements(
 ) -> dict[Any, tuple[int, int]]:
     """Extract and validate placed macro positions: macro_id -> (x, y).
 
+    Supports:
+        - Shared engine native Placement: `list[PlacedMacro]` or `Sequence[PlacedMacro]`
+        - Mapping representations: `dict[macro_id, (x, y)]` or `dict[macro_id, {"x": x, "y": y}]`
+        - Objects exposing a `.positions` attribute
+        - Sequences of items with `macro_id`/`id` and `x`, `y` coordinates
+
     Distinguishes supported incomplete placements from malformed placements.
-    Raises ValueError on out-of-bounds, negative, non-integer, or unknown macro coordinates.
+    Raises ValueError on out-of-bounds, negative, non-integer, duplicate,
+    or unknown macro coordinates.
     """
     if placement is None:
         return {}
 
+    # Unwrap .positions if present
     if hasattr(placement, "positions"):
-        raw_pos = placement.positions
-    elif isinstance(placement, Mapping):
-        raw_pos = placement
+        raw_source = placement.positions
     else:
-        # Check if placement implements mapping protocol
+        raw_source = placement
+
+    raw_items: list[tuple[Any, Any]] = []
+
+    if isinstance(raw_source, Mapping):
+        raw_items = list(raw_source.items())
+    elif isinstance(raw_source, (list, tuple, Sequence)) and not isinstance(
+        raw_source, (str, bytes)
+    ):
+        for item in raw_source:
+            if item is None:
+                continue
+            if hasattr(item, "macro_id") and hasattr(item, "x") and hasattr(item, "y"):
+                raw_items.append((item.macro_id, (item.x, item.y)))
+            elif hasattr(item, "id") and hasattr(item, "x") and hasattr(item, "y"):
+                raw_items.append((item.id, (item.x, item.y)))
+            elif isinstance(item, Mapping) and ("macro_id" in item or "id" in item):
+                mid = item.get("macro_id", item.get("id"))
+                raw_items.append((mid, (item.get("x"), item.get("y"))))
+            elif isinstance(item, (tuple, list)):
+                if len(item) == 2:
+                    raw_items.append((item[0], item[1]))
+                elif len(item) == 3:
+                    raw_items.append((item[0], (item[1], item[2])))
+                else:
+                    raise ValueError(
+                        f"Malformed placement item tuple of length {len(item)}: {item}"
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported placement item type '{type(item).__name__}': {item}"
+                )
+    else:
+        # Check if placement implements mapping subscription protocol
         try:
-            raw_pos = {m_id: placement[m_id] for m_id in macros if m_id in placement}
-        except (TypeError, AttributeError):
-            raw_pos = {}
+            raw_items = [(m_id, raw_source[m_id]) for m_id in macros if m_id in raw_source]
+        except (TypeError, AttributeError, KeyError):
+            raw_items = []
 
     placed: dict[Any, tuple[int, int]] = {}
 
-    for m_id, coord in raw_pos.items():
+    for m_id, coord in raw_items:
         if coord is None:
             # Explicitly unplaced in incomplete placement
             continue
+
+        if m_id in placed:
+            raise ValueError(f"Duplicate placement for macro '{m_id}'.")
 
         if m_id not in macros:
             raise ValueError(f"Placement references macro '{m_id}' not found in netlist.")
@@ -352,7 +390,7 @@ def _get_eligible_net_pin_centers(
 ) -> list[tuple[float, float]]:
     """Return placed pin centers (x + w/2, y + h/2) for a net.
 
-    Temporary helper to be replaced by `pin_positions(netlist, placement)`.
+    Reuses `get_macro_center` from `src.placement.hpwl`.
     """
     _, pins, _ = net
     centers: list[tuple[float, float]] = []
@@ -361,20 +399,28 @@ def _get_eligible_net_pin_centers(
             x, y = placements[m_id]
             w, h = macros[m_id]
             # Center of macro [x, x + w) x [y, y + h)
-            centers.append((x + w / 2.0, y + h / 2.0))
+            centers.append(get_macro_center(x, y, w, h))
     return centers
 
 
 def _calculate_hpwl(netlist: Any, placement: Any) -> float:
     """Calculate Half-Perimeter Wirelength (HPWL) for eligible nets.
 
-    Temporary private helper until Zoya's shared `hpwl.py` engine helper is available.
+    Reuses canonical `src.placement.hpwl.calculate_hpwl` when the netlist is an
+    engine `Netlist` instance and placements are validated. Maintains a documented
+    fallback for dictionary-based and mock netlists (e.g., `MockNetlist` with `pins`)
+    to preserve backward compatibility across heterogeneous test configurations.
     """
     grid_w, grid_h = _extract_grid_dimensions(netlist)
     macros = _extract_macros(netlist)
-    nets = _extract_nets(netlist)
     placements = _extract_placements(placement, macros, grid_w, grid_h)
 
+    # If netlist is a canonical engine Netlist instance, delegate directly to calculate_hpwl
+    if isinstance(netlist, Netlist):
+        return float(calculate_hpwl(netlist, placements, allow_incomplete=True))
+
+    # Compatibility fallback for dictionary/mock netlists (e.g. MockNetlist, dicts with 'pins')
+    nets = _extract_nets(netlist)
     total_hpwl = 0.0
 
     for net in nets:

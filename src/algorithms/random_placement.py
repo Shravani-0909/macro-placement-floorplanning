@@ -14,13 +14,8 @@ import math
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 import numpy as np
 
+from src.algorithms.common import extract_placed_ids, random_legal_placement
 from src.placement.objective import EvaluationResult, evaluate_placement
-
-# Dynamic import for Zoya's shared legal placement helper once implemented
-try:
-    from src.placement.legal import random_legal_placement  # type: ignore[import-untyped]
-except ImportError:
-    random_legal_placement = None
 
 
 class RandomPlacementResult(NamedTuple):
@@ -67,23 +62,7 @@ def _extract_macro_ids(netlist: Any) -> set[Any]:
     return set()
 
 
-def _extract_placed_ids(placement: Any) -> set[Any]:
-    """Extract the set of placed macro IDs from placement object or mapping."""
-    if placement is None:
-        return set()
-    if hasattr(placement, "positions"):
-        raw_pos = placement.positions
-    elif isinstance(placement, Mapping):
-        raw_pos = placement
-    else:
-        try:
-            raw_pos = {k: placement[k] for k in placement}
-        except (TypeError, AttributeError):
-            raw_pos = {}
-
-    if isinstance(raw_pos, Mapping):
-        return {k for k, v in raw_pos.items() if v is not None}
-    return set()
+_extract_placed_ids = extract_placed_ids
 
 
 def random_placement(
@@ -198,5 +177,6 @@ def random_placement(
 __all__ = [
     "PlacementResult",
     "RandomPlacementResult",
+    "random_legal_placement",
     "random_placement",
 ]

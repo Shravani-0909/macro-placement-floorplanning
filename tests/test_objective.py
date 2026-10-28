@@ -31,6 +31,8 @@ import math
 import numpy as np
 import pytest
 
+from src.placement.hpwl import calculate_hpwl
+from src.placement.models import Macro, Net, Netlist, PlacedMacro, Placement, placement_to_dict
 from src.placement.objective import (
     EvaluationResult,
     congestion_score,
@@ -1007,3 +1009,232 @@ def test_non_unit_weight_with_fractional_bounding_box_conservation():
     assert np.isclose(res.hpwl, expected_weighted_hpwl)
     expected_congestion = np.sum(expected_demand**2) / 16.0
     assert np.isclose(res.congestion, expected_congestion)
+
+
+# =============================================================================
+# Shared Engine Integration Tests (list[PlacedMacro] & Netlist compatibility)
+# =============================================================================
+
+
+def test_canonical_netlist_and_placed_macro_list_equivalence():
+    """Verify list[PlacedMacro] and dictionary placements produce identical metrics."""
+    macros = (
+        Macro(id=1, w=2, h=3),
+        Macro(id=2, w=1, h=2),
+        Macro(id=3, w=2, h=2),
+    )
+    nets = (
+        Net(id=10, macro_ids=(1, 2), weight=1.5),
+        Net(id=20, macro_ids=(2, 3), weight=2.0),
+        Net(id=30, macro_ids=(1, 3), weight=0.5),
+    )
+    netlist = Netlist(version="1.0", grid_w=10, grid_h=10, macros=macros, nets=nets)
+
+    placement_list: Placement = [
+        PlacedMacro(macro_id=1, x=1, y=2),
+        PlacedMacro(macro_id=2, x=5, y=1),
+        PlacedMacro(macro_id=3, x=2, y=6),
+    ]
+    placement_dict = {1: (1, 2), 2: (5, 1), 3: (2, 6)}
+
+    # Verify rudy_map
+    demand_list = rudy_map(netlist, placement_list)
+    demand_dict = rudy_map(netlist, placement_dict)
+    assert demand_list.shape == (10, 10)
+    assert np.all(demand_list >= 0.0)
+    np.testing.assert_allclose(demand_list, demand_dict, rtol=1e-12, atol=1e-12)
+
+    # Verify congestion_score
+    cong_list = congestion_score(netlist, placement_list)
+    cong_dict = congestion_score(netlist, placement_dict)
+    assert cong_list > 0.0
+    assert np.isclose(cong_list, cong_dict, rtol=1e-12, atol=1e-12)
+
+    # Verify evaluate_placement
+    res_list = evaluate_placement(netlist, placement_list, alpha=1.5, beta=2.5)
+    res_dict = evaluate_placement(netlist, placement_dict, alpha=1.5, beta=2.5)
+    assert isinstance(res_list, EvaluationResult)
+    assert np.isclose(res_list.hpwl, res_dict.hpwl, rtol=1e-12, atol=1e-12)
+    assert np.isclose(res_list.congestion, res_dict.congestion, rtol=1e-12, atol=1e-12)
+    assert np.isclose(res_list.objective, res_dict.objective, rtol=1e-12, atol=1e-12)
+
+    # Cross-verify with canonical calculate_hpwl
+    canonical_hpwl = calculate_hpwl(netlist, placement_list, allow_incomplete=False)
+    assert np.isclose(res_list.hpwl, canonical_hpwl, rtol=1e-12, atol=1e-12)
+
+
+def test_canonical_netlist_incomplete_and_empty_placement():
+    """Verify incomplete and empty placements behave consistently across list and dict formats."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=1, h=1),
+        Macro(id=3, w=1, h=1),
+    )
+    nets = (
+        Net(id=1, macro_ids=(1, 2), weight=1.0),
+        Net(id=2, macro_ids=(2, 3), weight=2.0),
+    )
+    netlist = Netlist(version="1.0", grid_w=6, grid_h=6, macros=macros, nets=nets)
+
+    # Empty placements (empty list, empty dict, None)
+    for empty_p in ([], {}, None):
+        demand = rudy_map(netlist, empty_p)
+        assert demand.shape == (6, 6)
+        assert np.all(demand == 0.0)
+
+        cong = congestion_score(netlist, empty_p)
+        assert cong == 0.0
+
+        eval_res = evaluate_placement(netlist, empty_p, alpha=1.0, beta=1.0)
+        assert eval_res.hpwl == 0.0
+        assert eval_res.congestion == 0.0
+        assert eval_res.objective == 0.0
+
+    # Incomplete placement: only 1 macro placed (no net has >= 2 pins)
+    p_one_list: Placement = [PlacedMacro(macro_id=1, x=0, y=0)]
+    p_one_dict = {1: (0, 0)}
+    for p_one in (p_one_list, p_one_dict):
+        demand = rudy_map(netlist, p_one)
+        assert np.all(demand == 0.0)
+        assert congestion_score(netlist, p_one) == 0.0
+        eval_res = evaluate_placement(netlist, p_one, alpha=1.0, beta=1.0)
+        assert eval_res.hpwl == 0.0
+        assert eval_res.congestion == 0.0
+        assert eval_res.objective == 0.0
+
+    # Incomplete placement: 2 out of 3 macros placed (net 1 eligible, net 2 incomplete)
+    p_two_list: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=2, y=0),
+    ]
+    p_two_dict = {1: (0, 0), 2: (2, 0)}
+    res_list = evaluate_placement(netlist, p_two_list, alpha=1.0, beta=2.0)
+    res_dict = evaluate_placement(netlist, p_two_dict, alpha=1.0, beta=2.0)
+    assert np.isclose(res_list.hpwl, res_dict.hpwl)
+    assert np.isclose(res_list.congestion, res_dict.congestion)
+    assert np.isclose(res_list.objective, res_dict.objective)
+    # Net 1 has centers (0.5, 0.5) and (2.5, 0.5), HPWL = 2.0
+    assert np.isclose(res_list.hpwl, 2.0)
+
+
+def test_canonical_netlist_with_no_nets():
+    """A canonical Netlist with no nets evaluates to zero HPWL, congestion, and objective."""
+    macros = (
+        Macro(id=1, w=2, h=2),
+        Macro(id=2, w=2, h=2),
+    )
+    netlist = Netlist(version="1.0", grid_w=8, grid_h=8, macros=macros, nets=())
+
+    placement_list: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=4, y=4),
+    ]
+    placement_dict = {1: (0, 0), 2: (4, 4)}
+
+    for p in (placement_list, placement_dict):
+        demand = rudy_map(netlist, p)
+        assert demand.shape == (8, 8)
+        assert np.all(demand == 0.0)
+
+        cong = congestion_score(netlist, p)
+        assert cong == 0.0
+
+        eval_res = evaluate_placement(netlist, p, alpha=3.0, beta=4.0)
+        assert eval_res.hpwl == 0.0
+        assert eval_res.congestion == 0.0
+        assert eval_res.objective == 0.0
+
+
+def test_placed_macro_list_input_immutability():
+    """Verify rudy_map, congestion_score, and evaluate_placement do not mutate Placement list."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=1, h=1),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=4, grid_h=4, macros=macros, nets=nets)
+
+    placement: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=2, y=2),
+    ]
+    snapshot = list(placement)
+
+    rudy_map(netlist, placement)
+    assert placement == snapshot
+
+    congestion_score(netlist, placement)
+    assert placement == snapshot
+
+    evaluate_placement(netlist, placement, alpha=1.0, beta=1.0)
+    assert placement == snapshot
+
+
+def test_placed_macro_list_validation_errors():
+    """Validation errors (out-of-bounds, negative, duplicate, unknown) raise ValueError on Placement lists."""
+    macros = (Macro(id=1, w=2, h=2), Macro(id=2, w=2, h=2))
+    netlist = Netlist(version="1.0", grid_w=5, grid_h=5, macros=macros, nets=())
+
+    # Out of bounds
+    with pytest.raises(ValueError, match="exceeds grid boundaries"):
+        rudy_map(netlist, [PlacedMacro(macro_id=1, x=4, y=0)])
+
+    # Negative coordinates
+    with pytest.raises(ValueError, match="negative coordinates"):
+        rudy_map(netlist, [PlacedMacro(macro_id=1, x=-1, y=0)])
+
+    # Unknown macro ID
+    with pytest.raises(ValueError, match="not found in netlist"):
+        rudy_map(netlist, [PlacedMacro(macro_id=999, x=0, y=0)])
+
+    # Duplicate macro placement
+    with pytest.raises(ValueError, match="Duplicate placement"):
+        rudy_map(netlist, [PlacedMacro(macro_id=1, x=0, y=0), PlacedMacro(macro_id=1, x=1, y=1)])
+
+
+def test_degenerate_bounding_boxes_with_canonical_netlist():
+    """Verify degenerate corridors (same-row, same-column, zero-span) with canonical Netlist & Placement."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=1, h=1),
+    )
+    # Same row: net connects 1 and 2
+    netlist_row = Netlist(
+        version="1.0",
+        grid_w=4,
+        grid_h=4,
+        macros=macros,
+        nets=(Net(id=1, macro_ids=(1, 2), weight=1.0),),
+    )
+    # Pin centers at (0.5, 1.5) and (2.5, 1.5) -> H=0, row 1 corridor
+    placement_row: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=1),
+        PlacedMacro(macro_id=2, x=2, y=1),
+    ]
+    demand_row = rudy_map(netlist_row, placement_row)
+    # Row 1 must have positive demand, all other rows zero
+    assert np.all(demand_row[0, :] == 0.0)
+    assert np.all(demand_row[2:, :] == 0.0)
+    assert np.isclose(np.sum(demand_row), 2.0)  # HPWL = 2.0 conserved
+
+    # Same column: pin centers at (1.5, 0.5) and (1.5, 2.5) -> W=0, col 1 corridor
+    placement_col: Placement = [
+        PlacedMacro(macro_id=1, x=1, y=0),
+        PlacedMacro(macro_id=2, x=1, y=2),
+    ]
+    demand_col = rudy_map(netlist_row, placement_col)
+    assert np.all(demand_col[:, 0] == 0.0)
+    assert np.all(demand_col[:, 2:] == 0.0)
+    assert np.isclose(np.sum(demand_col), 2.0)  # HPWL = 2.0 conserved
+
+    # Zero span: identical centers at (0.5, 0.5)
+    placement_zero: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=0, y=0),
+    ]
+    demand_zero = rudy_map(netlist_row, placement_zero)
+    assert np.all(demand_zero == 0.0)
+    eval_zero = evaluate_placement(netlist_row, placement_zero, alpha=1.0, beta=1.0)
+    assert eval_zero.hpwl == 0.0
+    assert eval_zero.congestion == 0.0
+    assert eval_zero.objective == 0.0

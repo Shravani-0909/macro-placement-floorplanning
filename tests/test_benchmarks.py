@@ -182,3 +182,75 @@ async def test_run_benchmark_suite_output_files(tmp_path: Path) -> None:
     assert (tmp_path / "benchmark_raw_results.csv").exists()
     assert (tmp_path / "benchmark_summary.json").exists()
     assert (tmp_path / "benchmark_summary.csv").exists()
+
+
+@async_test
+async def test_execute_single_benchmark_run_greedy() -> None:
+    """Greedy benchmark execution resolves runner and produces valid result."""
+    suite = get_default_benchmark_suite()
+    netlist = suite["toy_4"]
+
+    result = await execute_single_benchmark_run(
+        algorithm="greedy",
+        netlist_id="toy_4",
+        netlist=netlist,
+        seed=42,
+    )
+
+    assert result.success is True
+    assert result.is_legal is True
+    assert result.is_complete is True
+    assert result.hpwl is not None
+    assert result.hpwl > 0.0
+    assert result.runtime_sec > 0.0
+    assert result.error is None
+
+
+@async_test
+async def test_execute_single_benchmark_run_sa() -> None:
+    """SA benchmark execution resolves runner and produces valid result."""
+    suite = get_default_benchmark_suite()
+    netlist = suite["toy_4"]
+
+    result = await execute_single_benchmark_run(
+        algorithm="sa",
+        netlist_id="toy_4",
+        netlist=netlist,
+        seed=42,
+        config={"max_iterations": 10, "cooling_rate": 0.8},
+    )
+
+    assert result.success is True
+    assert result.is_legal is True
+    assert result.is_complete is True
+    assert result.hpwl is not None
+    assert result.hpwl > 0.0
+    assert result.runtime_sec > 0.0
+    assert result.error is None
+
+
+@async_test
+async def test_run_benchmark_suite_all_classical(tmp_path: Path) -> None:
+    """Full suite invocation runs random, greedy, and sa across benchmark instances."""
+    mini_suite = {
+        "tiny": Netlist(
+            version="1.0",
+            grid_w=10,
+            grid_h=10,
+            macros=(Macro(0, 2, 2), Macro(1, 2, 2)),
+            nets=(Net(0, (0, 1)),),
+        )
+    }
+
+    raw, summaries = await run_benchmark_suite(
+        netlists=mini_suite,
+        algorithms=["random", "greedy", "sa"],
+        seeds=[42],
+        output_dir=tmp_path,
+    )
+
+    assert len(raw) == 3
+    assert len(summaries) == 3
+    assert all(s.success_rate == 1.0 for s in summaries)
+    algo_names = {s.algorithm for s in summaries}
+    assert algo_names == {"random", "greedy", "sa"}

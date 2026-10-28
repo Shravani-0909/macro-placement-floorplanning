@@ -19,13 +19,12 @@ import math
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 import numpy as np
 
+from src.algorithms.common import extract_placed_ids, to_canonical_netlist
+from src.placement.engine import PlacementEngine
 from src.placement.objective import EvaluationResult, evaluate_placement
 
-# Dynamic import for Zoya's shared GridEnv once implemented
-try:
-    from src.placement.grid import GridEnv  # type: ignore[import-untyped]
-except ImportError:
-    GridEnv = None
+# Dynamic alias for PlacementEngine (preserving GridEnv backward-compatibility)
+GridEnv = PlacementEngine
 
 
 class GreedyPlacementResult(NamedTuple):
@@ -88,23 +87,36 @@ def _extract_macros(netlist: Any) -> dict[Any, tuple[int, int]]:
     return macro_dict
 
 
-def _extract_placed_ids(placement: Any) -> set[Any]:
-    """Extract set of placed macro IDs from placement mapping or object."""
-    if placement is None:
-        return set()
-    if hasattr(placement, "positions"):
-        raw_pos = placement.positions
-    elif isinstance(placement, Mapping):
-        raw_pos = placement
-    else:
-        try:
-            raw_pos = {k: placement[k] for k in placement}
-        except (TypeError, AttributeError):
-            raw_pos = {}
+_extract_placed_ids = extract_placed_ids
 
-    if isinstance(raw_pos, Mapping):
-        return {k for k, v in raw_pos.items() if v is not None}
-    return set()
+
+def _get_env_placement(env: Any) -> Any:
+    """Extract placement representation from environment instance."""
+    if hasattr(env, "placement"):
+        return env.placement()
+    elif hasattr(env, "get_placement"):
+        return env.get_placement()
+    return {}
+
+
+def _query_legal_anchors(env: Any, m_id: Any) -> list[tuple[int, int]]:
+    """Retrieve legal (x, y) anchors for macro m_id in row-major order."""
+    if hasattr(env, "get_legal_positions"):
+        return env.get_legal_positions(m_id)
+    elif hasattr(env, "legal_mask"):
+        mask = env.legal_mask(m_id)
+        if mask is None:
+            return []
+        mask_arr = np.asarray(mask, dtype=bool)
+        if mask_arr.ndim != 2 or not np.any(mask_arr):
+            return []
+        grid_h, grid_w = mask_arr.shape
+        return [(x, y) for y in range(grid_h) for x in range(grid_w) if mask_arr[y, x]]
+    elif hasattr(env, "compute_action_mask"):
+        mask = env.compute_action_mask(m_id, flatten=False)
+        grid_h, grid_w = mask.shape
+        return [(x, y) for y in range(grid_h) for x in range(grid_w) if mask[y, x]]
+    return []
 
 
 def _get_sorted_macro_ids(macros: dict[Any, tuple[int, int]]) -> list[Any]:
@@ -187,7 +199,10 @@ def greedy_placement(
         )
 
     # 1. Instantiate the grid environment
-    env = cls(netlist)
+    if cls is PlacementEngine:
+        env = cls(to_canonical_netlist(netlist))
+    else:
+        env = cls(netlist)
 
     # 2. Extract macros and determine deterministic placement order
     macros = _extract_macros(netlist)
@@ -195,23 +210,10 @@ def greedy_placement(
 
     # 3. Place macros sequentially
     for m_id in sorted_macro_ids:
-        mask = env.legal_mask(m_id)
-
-        if mask is None:
-            partial_placement = env.placement() if hasattr(env, "placement") else None
-            return GreedyPlacementResult(
-                placement=partial_placement,
-                success=False,
-                hpwl=None,
-                congestion=None,
-                objective=None,
-            )
-
-        # Ensure mask is converted to 2D numpy array
-        mask_arr = np.asarray(mask, dtype=bool)
-        if mask_arr.ndim != 2 or not np.any(mask_arr):
+        anchors = _query_legal_anchors(env, m_id)
+        if not anchors:
             # Dead end: no legal position exists for this macro
-            partial_placement = env.placement() if hasattr(env, "placement") else None
+            partial_placement = _get_env_placement(env)
             return GreedyPlacementResult(
                 placement=partial_placement,
                 success=False,
@@ -220,21 +222,31 @@ def greedy_placement(
                 objective=None,
             )
 
-        grid_h, grid_w = mask_arr.shape
         best_anchor: tuple[int, int] | None = None
         min_delta = float("inf")
 
         # Enumerate legal anchors in deterministic row-major order (y then x)
-        for y in range(grid_h):
-            for x in range(grid_w):
-                if mask_arr[y, x]:
-                    delta = env.hpwl_delta_move(m_id, x, y)
-                    if delta < min_delta:
-                        min_delta = delta
-                        best_anchor = (x, y)
+        for x, y in anchors:
+            if hasattr(env, "hpwl_delta_move"):
+                delta = env.hpwl_delta_move(m_id, x, y)
+            else:
+                env.place(m_id, x, y)
+                try:
+                    delta = env.current_hpwl(allow_incomplete=True)
+                finally:
+                    try:
+                        env.unplace(m_id)
+                    except Exception as cleanup_err:
+                        raise RuntimeError(
+                            f"Failed to unplace temporary macro '{m_id}' from ({x}, {y}): {cleanup_err}"
+                        ) from cleanup_err
+
+            if delta < min_delta:
+                min_delta = delta
+                best_anchor = (x, y)
 
         if best_anchor is None:
-            partial_placement = env.placement() if hasattr(env, "placement") else None
+            partial_placement = _get_env_placement(env)
             return GreedyPlacementResult(
                 placement=partial_placement,
                 success=False,
@@ -248,7 +260,7 @@ def greedy_placement(
         env.place(m_id, place_x, place_y)
 
     # 4. Retrieve complete placement
-    final_placement = env.placement() if hasattr(env, "placement") else {}
+    final_placement = _get_env_placement(env)
 
     # Verify placement completeness
     macro_ids_set = set(macros.keys())

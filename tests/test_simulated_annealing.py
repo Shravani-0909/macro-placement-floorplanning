@@ -30,6 +30,8 @@ from typing import Any, Sequence
 import numpy as np
 import pytest
 
+from src.placement.engine import PlacementEngine
+from src.placement.models import Macro, Net, Netlist, PlacedMacro, Placement
 from src.algorithms.simulated_annealing import (
     PlacementResult,
     SimulatedAnnealingResult,
@@ -688,25 +690,14 @@ def test_incomplete_initial_placement_returns_failure(sample_netlist):
 
 
 def test_true_integration_with_shared_engine(sample_netlist):
-    """True integration test with Zoya's shared legal helper and GridEnv.
-
-    Skipped if either shared module is not yet implemented.
-    """
-    try:
-        from src.placement.legal import random_legal_placement as shared_legal  # type: ignore[import-untyped]
-        from src.placement.grid import GridEnv as SharedGridEnv  # type: ignore[import-untyped]
-    except ImportError:
-        pytest.skip(
-            "Integration pending: Zoya's shared engine modules 'src.placement.legal' "
-            "or 'src.placement.grid' are not yet implemented."
-        )
-
-    res = simulated_annealing(sample_netlist)
+    """True integration test with shared engine PlacementEngine."""
+    res = simulated_annealing(sample_netlist, max_iterations=5, seed=42)
     assert isinstance(res, SimulatedAnnealingResult)
-    if res.success:
-        assert res.hpwl is not None
-        assert res.congestion is not None
-        assert res.objective is not None
+    assert res.success is True
+    assert res.placement is not None
+    assert res.hpwl is not None
+    assert res.congestion is not None
+    assert res.objective is not None
 
 
 # =============================================================================
@@ -1085,3 +1076,437 @@ def test_replay_fallback_order_independent_of_dict_insertion_order():
     assert seq1 == seq2
     assert res1.placement == res2.placement
     assert res1.objective == res2.objective
+
+
+# =============================================================================
+# 25. Canonical Netlist and Placement List Integration
+# =============================================================================
+
+
+def test_simulated_annealing_canonical_netlist():
+    """SA works end-to-end with canonical Netlist instances using PlacementEngine."""
+    macros = (
+        Macro(id=1, w=2, h=2),
+        Macro(id=2, w=2, h=2),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=6, grid_h=6, macros=macros, nets=nets)
+
+    res = simulated_annealing(
+        netlist,
+        initial_temperature=20.0,
+        cooling_rate=0.85,
+        min_temperature=1.0,
+        max_iterations=10,
+        seed=42,
+    )
+    assert res.success is True
+    assert res.placement is not None
+    assert len(res.placement) == 2
+    assert res.hpwl is not None
+    assert res.congestion is not None
+    assert res.objective is not None
+
+
+def test_simulated_annealing_with_placement_list_initial():
+    """SA accepts and returns list[PlacedMacro] representation when supplied as initial placement."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=1, h=1),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=4, grid_h=4, macros=macros, nets=nets)
+
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=3, y=3),
+    ]
+
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        initial_temperature=10.0,
+        cooling_rate=0.8,
+        min_temperature=1.0,
+        max_iterations=5,
+        seed=42,
+    )
+    assert res.success is True
+    assert isinstance(res.placement, list)
+    assert len(res.placement) == 2
+    assert all(isinstance(pm, PlacedMacro) for pm in res.placement)
+    assert res.objective <= evaluate_placement(netlist, init_p, 1.0, 1.0).objective
+
+
+# =============================================================================
+# 26. Move Types (Shift, Swap, Relocate) and Operator Legality
+# =============================================================================
+
+
+def test_sa_move_weights_validation():
+    """Validate move_weights and shift_window constraints."""
+    netlist = {"grid_w": 5, "grid_h": 5, "macros": {"A": (1, 1)}, "nets": []}
+
+    # Non-mapping move_weights
+    with pytest.raises(ValueError, match="move_weights must be a mapping"):
+        simulated_annealing(netlist, move_weights=["shift", "swap"])
+
+    # Unknown move type
+    with pytest.raises(ValueError, match="Unknown move type in move_weights"):
+        simulated_annealing(netlist, move_weights={"rotate": 1.0})
+
+    # Negative move weight
+    with pytest.raises(ValueError, match="must be finite and non-negative"):
+        simulated_annealing(netlist, move_weights={"shift": -0.5})
+
+    # Non-numeric move weight
+    with pytest.raises(ValueError, match="must be numeric"):
+        simulated_annealing(netlist, move_weights={"shift": "high"})
+
+    # Boolean move weight
+    with pytest.raises(ValueError, match="must be numeric"):
+        simulated_annealing(netlist, move_weights={"shift": True})
+
+    # All zero weights
+    with pytest.raises(ValueError, match="At least one move type"):
+        simulated_annealing(
+            netlist, move_weights={"shift": 0.0, "swap": 0.0, "relocate": 0.0}
+        )
+
+    # Invalid shift_window
+    with pytest.raises(ValueError, match="shift_window must be a positive integer"):
+        simulated_annealing(netlist, shift_window=0)
+
+    with pytest.raises(ValueError, match="shift_window must be a positive integer"):
+        simulated_annealing(netlist, shift_window=-2)
+
+    with pytest.raises(ValueError, match="shift_window must be a positive integer"):
+        simulated_annealing(netlist, shift_window=1.5)
+
+    with pytest.raises(ValueError, match="shift_window must be a positive integer"):
+        simulated_annealing(netlist, shift_window=True)
+
+
+def test_sa_relocate_move_operator():
+    """Relocate operator moves macro globally across the grid."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=1, h=1),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=10, grid_h=10, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=9, y=9),
+    ]
+
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        move_weights={"relocate": 1.0, "shift": 0.0, "swap": 0.0},
+        initial_temperature=100.0,
+        cooling_rate=0.9,
+        min_temperature=1.0,
+        max_iterations=20,
+        seed=42,
+    )
+    assert res.success is True
+    assert res.placement is not None
+    engine = PlacementEngine(netlist)
+    for pm in res.placement:
+        engine.place(pm.macro_id, pm.x, pm.y)
+
+
+def test_sa_shift_move_operator():
+    """Shift operator displaces a macro within a local shift_window."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=1, h=1),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=10, grid_h=10, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=5, y=5),
+        PlacedMacro(macro_id=2, x=0, y=0),
+    ]
+
+    fake_rng = FakeRNG(choices=[1, (5, 6)], random_values=[0.0])
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        move_weights={"shift": 1.0, "swap": 0.0, "relocate": 0.0},
+        shift_window=1,
+        rng=fake_rng,
+        initial_temperature=10.0,
+        cooling_rate=0.8,
+        min_temperature=1.0,
+        max_iterations=1,
+    )
+    assert res.success is True
+    assert res.accepted_moves == 1
+    p_dict = {pm.macro_id: (pm.x, pm.y) for pm in res.placement}
+    assert max(abs(p_dict[1][0] - 5), abs(p_dict[1][1] - 5)) <= 1
+
+
+def test_sa_valid_swap_compatible_dimensions():
+    """Swap operator correctly exchanges coordinates of dimensionally compatible macros."""
+    macros = (
+        Macro(id=1, w=2, h=2),
+        Macro(id=2, w=2, h=2),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=6, grid_h=6, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=3, y=3),
+    ]
+
+    fake_rng = FakeRNG(choices=[1, 2], random_values=[0.0])
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        move_weights={"swap": 1.0, "shift": 0.0, "relocate": 0.0},
+        rng=fake_rng,
+        initial_temperature=100.0,
+        cooling_rate=0.8,
+        min_temperature=1.0,
+        max_iterations=1,
+    )
+    assert res.success is True
+    assert res.accepted_moves == 1
+    p_dict = {pm.macro_id: (pm.x, pm.y) for pm in res.placement}
+    assert p_dict[1] == (3, 3)
+    assert p_dict[2] == (0, 0)
+
+
+def test_sa_invalid_swap_incompatible_dimensions():
+    """Swap between macros with incompatible dimensions causing boundary violation is rejected safely."""
+    macros = (
+        Macro(id=1, w=3, h=1),
+        Macro(id=2, w=1, h=2),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=3, grid_h=3, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=2, y=1),
+    ]
+
+    fake_rng = FakeRNG(choices=[1, 2], random_values=[0.0])
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        move_weights={"swap": 1.0, "shift": 0.0, "relocate": 0.0},
+        rng=fake_rng,
+        initial_temperature=10.0,
+        cooling_rate=0.8,
+        min_temperature=1.0,
+        max_iterations=1,
+    )
+    assert res.success is True
+    assert res.accepted_moves == 0
+    p_dict = {pm.macro_id: (pm.x, pm.y) for pm in res.placement}
+    assert p_dict[1] == (0, 0)
+    assert p_dict[2] == (2, 1)
+
+
+def test_sa_invalid_swap_causing_overlap():
+    """Swap between two macros that causes overlap with a third macro is rejected safely."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=2, h=2),
+        Macro(id=3, w=1, h=1),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=5, grid_h=5, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=2, y=2),
+        PlacedMacro(macro_id=3, x=1, y=0),
+    ]
+
+    fake_rng = FakeRNG(choices=[1, 2], random_values=[0.0])
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        move_weights={"swap": 1.0, "shift": 0.0, "relocate": 0.0},
+        rng=fake_rng,
+        initial_temperature=10.0,
+        cooling_rate=0.8,
+        min_temperature=1.0,
+        max_iterations=1,
+    )
+    assert res.success is True
+    assert res.accepted_moves == 0
+    p_dict = {pm.macro_id: (pm.x, pm.y) for pm in res.placement}
+    assert p_dict[1] == (0, 0)
+    assert p_dict[2] == (2, 2)
+    assert p_dict[3] == (1, 0)
+
+
+def test_sa_rejected_swap_preserves_active_env_state():
+    """Verify that an illegal swap leaves active_env in its exact initial state."""
+    macros = (
+        Macro(id=1, w=3, h=1),
+        Macro(id=2, w=1, h=2),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=3, grid_h=3, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=2, y=1),
+    ]
+
+    class SpyEngine(PlacementEngine):
+        instances: list[SpyEngine] = []
+
+        def __init__(self, nl: Any):
+            super().__init__(nl)
+            SpyEngine.instances.append(self)
+
+    SpyEngine.instances.clear()
+    fake_rng = FakeRNG(choices=[1, 2], random_values=[0.0])
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        env_class=SpyEngine,
+        move_weights={"swap": 1.0, "shift": 0.0, "relocate": 0.0},
+        rng=fake_rng,
+        initial_temperature=10.0,
+        cooling_rate=0.8,
+        min_temperature=1.0,
+        max_iterations=1,
+    )
+    assert res.success is True
+    assert res.accepted_moves == 0
+    assert len(SpyEngine.instances) >= 1
+    active = SpyEngine.instances[0]
+    assert active.is_placed(1)
+    assert active.is_placed(2)
+    placed_map = {pm.macro_id: (pm.x, pm.y) for pm in active.get_placement()}
+    assert placed_map[1] == (0, 0)
+    assert placed_map[2] == (2, 1)
+
+
+def test_sa_unavailable_move_type_handles_safely_no_infinite_loop():
+    """When a chosen move type cannot be applied (e.g. swap on 1 macro), it handles safely."""
+    macros = (Macro(id=1, w=1, h=1),)
+    nets = ()
+    netlist = Netlist(version="1.0", grid_w=3, grid_h=3, macros=macros, nets=nets)
+    init_p: Placement = [PlacedMacro(macro_id=1, x=0, y=0)]
+
+    res = simulated_annealing(
+        netlist,
+        initial_placement=init_p,
+        move_weights={"swap": 1.0, "shift": 0.0, "relocate": 0.0},
+        initial_temperature=10.0,
+        cooling_rate=0.5,
+        min_temperature=1.0,
+        max_iterations=5,
+    )
+    assert res.success is True
+    assert res.iterations > 0
+    assert res.accepted_moves == 0
+
+
+def test_sa_exception_during_evaluation_restores_state(monkeypatch):
+    """An exception during candidate evaluation leaves active_env intact with original macros."""
+    macros = (
+        Macro(id=1, w=2, h=2),
+        Macro(id=2, w=2, h=2),
+    )
+    nets = (Net(id=1, macro_ids=(1, 2), weight=1.0),)
+    netlist = Netlist(version="1.0", grid_w=6, grid_h=6, macros=macros, nets=nets)
+    init_p: Placement = [
+        PlacedMacro(macro_id=1, x=0, y=0),
+        PlacedMacro(macro_id=2, x=3, y=3),
+    ]
+
+    class SpyEngine(PlacementEngine):
+        instances: list[SpyEngine] = []
+
+        def __init__(self, nl: Any):
+            super().__init__(nl)
+            SpyEngine.instances.append(self)
+
+    SpyEngine.instances.clear()
+
+    import src.algorithms.simulated_annealing as sa_mod
+    orig_eval = sa_mod.evaluate_placement
+    call_count = 0
+
+    def faulty_eval(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:  # allow initial evaluation, fail on candidate evaluation
+            raise RuntimeError("Corrupted evaluator")
+        return orig_eval(*args, **kwargs)
+
+    monkeypatch.setattr(sa_mod, "evaluate_placement", faulty_eval)
+
+    fake_rng = FakeRNG(choices=[1, 2], random_values=[0.0])
+    with pytest.raises(RuntimeError, match="Corrupted evaluator"):
+        simulated_annealing(
+            netlist,
+            initial_placement=init_p,
+            env_class=SpyEngine,
+            move_weights={"swap": 1.0, "shift": 0.0, "relocate": 0.0},
+            rng=fake_rng,
+            initial_temperature=100.0,
+            cooling_rate=0.8,
+            min_temperature=1.0,
+            max_iterations=1,
+        )
+
+    assert len(SpyEngine.instances) >= 1
+    active = SpyEngine.instances[0]
+    assert active.is_placed(1)
+    assert active.is_placed(2)
+    placed_map = {pm.macro_id: (pm.x, pm.y) for pm in active.get_placement()}
+    assert placed_map[1] == (0, 0)
+    assert placed_map[2] == (3, 3)
+
+
+def test_sa_deterministic_reproducibility_with_all_moves():
+    """Simulated Annealing is strictly reproducible with the same seed when all move types are active."""
+    macros = (
+        Macro(id=1, w=1, h=1),
+        Macro(id=2, w=2, h=1),
+        Macro(id=3, w=1, h=2),
+    )
+    nets = (
+        Net(id=1, macro_ids=(1, 2), weight=1.0),
+        Net(id=2, macro_ids=(2, 3), weight=1.5),
+    )
+    netlist = Netlist(version="1.0", grid_w=6, grid_h=6, macros=macros, nets=nets)
+
+    res1 = simulated_annealing(
+        netlist,
+        move_weights={"shift": 1.0, "swap": 1.0, "relocate": 1.0},
+        shift_window=2,
+        seed=777,
+        initial_temperature=50.0,
+        cooling_rate=0.9,
+        min_temperature=0.1,
+        max_iterations=30,
+    )
+
+    res2 = simulated_annealing(
+        netlist,
+        move_weights={"shift": 1.0, "swap": 1.0, "relocate": 1.0},
+        shift_window=2,
+        seed=777,
+        initial_temperature=50.0,
+        cooling_rate=0.9,
+        min_temperature=0.1,
+        max_iterations=30,
+    )
+
+    assert res1.success is True
+    assert res2.success is True
+    assert res1.iterations == res2.iterations
+    assert res1.accepted_moves == res2.accepted_moves
+    assert math.isclose(res1.objective, res2.objective)
+    p1 = {pm.macro_id: (pm.x, pm.y) for pm in res1.placement}
+    p2 = {pm.macro_id: (pm.x, pm.y) for pm in res2.placement}
+    assert p1 == p2

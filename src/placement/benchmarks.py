@@ -352,7 +352,16 @@ async def run_benchmark_suite(
 ) -> tuple[list[BenchmarkRunResult], list[BenchmarkSummary]]:
     """Run full benchmark evaluation matrix across netlists, algorithms, and seeds."""
     suite = netlists if netlists is not None else get_default_benchmark_suite()
-    algos = algorithms if algorithms is not None else list(ALGORITHM_REGISTRY.keys())
+    if algorithms is not None:
+        algos = algorithms
+    else:
+        # Default canonical benchmark algorithms (avoiding duplicate runs of alias 'simulated_annealing')
+        default_order = ["random", "greedy", "sa"]
+        registered = ALGORITHM_REGISTRY.keys()
+        algos = [a for a in default_order if a in registered]
+        for a in registered:
+            if a not in algos and a != "simulated_annealing":
+                algos.append(a)
     seed_list = seeds if seeds is not None else [42, 100, 2026]
 
     raw_results: list[BenchmarkRunResult] = []
