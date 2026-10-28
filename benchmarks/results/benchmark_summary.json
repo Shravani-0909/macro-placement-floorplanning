@@ -1,0 +1,44 @@
+[
+  {
+    "algorithm": "random",
+    "netlist_id": "toy_4",
+    "total_runs": 3,
+    "success_count": 3,
+    "success_rate": 1.0,
+    "mean_hpwl": 61.0,
+    "median_hpwl": 62.5,
+    "min_hpwl": 53.0,
+    "max_hpwl": 67.5,
+    "std_hpwl": 7.365459931328117,
+    "mean_runtime_sec": 0.005412777332821861,
+    "median_runtime_sec": 0.0053611660114256665
+  },
+  {
+    "algorithm": "random",
+    "netlist_id": "medium_8",
+    "total_runs": 3,
+    "success_count": 3,
+    "success_rate": 1.0,
+    "mean_hpwl": 234.66666666666666,
+    "median_hpwl": 236.75,
+    "min_hpwl": 201.5,
+    "max_hpwl": 265.75,
+    "std_hpwl": 32.17562483205778,
+    "mean_runtime_sec": 0.014397778000178127,
+    "median_runtime_sec": 0.014425375004066154
+  },
+  {
+    "algorithm": "random",
+    "netlist_id": "dense_10",
+    "total_runs": 3,
+    "success_count": 3,
+    "success_rate": 1.0,
+    "mean_hpwl": 250.41666666666666,
+    "median_hpwl": 245.0,
+    "min_hpwl": 241.5,
+    "max_hpwl": 264.75,
+    "std_hpwl": 12.535782118931923,
+    "mean_runtime_sec": 0.015825444327977795,
+    "median_runtime_sec": 0.01577937499678228
+  }
+]

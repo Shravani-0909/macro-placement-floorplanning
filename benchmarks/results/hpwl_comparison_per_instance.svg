@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 360" width="900" height="360" style="background:#ffffff; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;">
+  <style>
+    .title { font-size: 16px; font-weight: bold; fill: #1f2937; }
+    .subtitle { font-size: 12px; fill: #6b7280; }
+    .panel-title { font-size: 13px; font-weight: 600; fill: #111827; }
+    .axis-line { stroke: #e5e7eb; stroke-width: 1; }
+    .bar-text { font-size: 11px; fill: #374151; text-anchor: middle; }
+    .legend { font-size: 11px; fill: #4b5563; }
+  </style>
+  <text x="30" y="32" class="title">Macro Placement HPWL Evaluation across Seeds (Random Baseline)</text>
+  <text x="30" y="50" class="subtitle">Note: Each benchmark instance represents a distinct circuit size and grid scale; raw HPWL is non-comparable across instances.</text>
+  <g transform="translate(30, 80)">
+    <rect width="260" height="240" fill="#f9fafb" rx="8" stroke="#e5e7eb"/>
+    <text x="130.0" y="25" text-anchor="middle" class="panel-title">toy_4 (15x15, 4 macros)</text>
+    <line x1="35" y1="200.0" x2="245" y2="200.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="204.0" font-size="9" fill="#9ca3af" text-anchor="end">50</text>
+    <line x1="35" y1="153.33333333333334" x2="245" y2="153.33333333333334" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="157.33333333333334" font-size="9" fill="#9ca3af" text-anchor="end">58</text>
+    <line x1="35" y1="106.66666666666667" x2="245" y2="106.66666666666667" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="110.66666666666667" font-size="9" fill="#9ca3af" text-anchor="end">66</text>
+    <line x1="35" y1="60.0" x2="245" y2="60.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="64.0" font-size="9" fill="#9ca3af" text-anchor="end">75</text>
+    <rect x="55" y="102.0" width="40" height="98.0" fill="#3b82f6" rx="3"/>
+    <text x="75.0" y="96.0" class="bar-text" font-weight="bold">67.5</text>
+    <text x="75.0" y="215" class="bar-text">seed 42</text>
+    <rect x="110" y="130.0" width="40" height="70.0" fill="#10b981" rx="3"/>
+    <text x="130.0" y="124.0" class="bar-text" font-weight="bold">62.5</text>
+    <text x="130.0" y="215" class="bar-text">seed 100</text>
+    <rect x="165" y="183.2" width="40" height="16.8" fill="#8b5cf6" rx="3"/>
+    <text x="185.0" y="177.2" class="bar-text" font-weight="bold">53.0</text>
+    <text x="185.0" y="215" class="bar-text">seed 2026</text>
+    <text x="130.0" y="232" font-size="10" fill="#4b5563" text-anchor="middle">mean: 61.0 | std: 7.4</text>
+  </g>
+  <g transform="translate(315, 80)">
+    <rect width="260" height="240" fill="#f9fafb" rx="8" stroke="#e5e7eb"/>
+    <text x="130.0" y="25" text-anchor="middle" class="panel-title">medium_8 (30x30, 8 macros)</text>
+    <line x1="35" y1="200.0" x2="245" y2="200.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="204.0" font-size="9" fill="#9ca3af" text-anchor="end">180</text>
+    <line x1="35" y1="153.33333333333334" x2="245" y2="153.33333333333334" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="157.33333333333334" font-size="9" fill="#9ca3af" text-anchor="end">216</text>
+    <line x1="35" y1="106.66666666666667" x2="245" y2="106.66666666666667" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="110.66666666666667" font-size="9" fill="#9ca3af" text-anchor="end">253</text>
+    <line x1="35" y1="60.0" x2="245" y2="60.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="64.0" font-size="9" fill="#9ca3af" text-anchor="end">290</text>
+    <rect x="55" y="90.86363636363636" width="40" height="109.13636363636364" fill="#3b82f6" rx="3"/>
+    <text x="75.0" y="84.86363636363636" class="bar-text" font-weight="bold">265.8</text>
+    <text x="75.0" y="215" class="bar-text">seed 42</text>
+    <rect x="110" y="127.77272727272728" width="40" height="72.22727272727272" fill="#10b981" rx="3"/>
+    <text x="130.0" y="121.77272727272728" class="bar-text" font-weight="bold">236.8</text>
+    <text x="130.0" y="215" class="bar-text">seed 100</text>
+    <rect x="165" y="172.63636363636363" width="40" height="27.363636363636363" fill="#8b5cf6" rx="3"/>
+    <text x="185.0" y="166.63636363636363" class="bar-text" font-weight="bold">201.5</text>
+    <text x="185.0" y="215" class="bar-text">seed 2026</text>
+    <text x="130.0" y="232" font-size="10" fill="#4b5563" text-anchor="middle">mean: 234.7 | std: 32.2</text>
+  </g>
+  <g transform="translate(600, 80)">
+    <rect width="260" height="240" fill="#f9fafb" rx="8" stroke="#e5e7eb"/>
+    <text x="130.0" y="25" text-anchor="middle" class="panel-title">dense_10 (24x24, 10 macros)</text>
+    <line x1="35" y1="200.0" x2="245" y2="200.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="204.0" font-size="9" fill="#9ca3af" text-anchor="end">220</text>
+    <line x1="35" y1="153.33333333333334" x2="245" y2="153.33333333333334" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="157.33333333333334" font-size="9" fill="#9ca3af" text-anchor="end">240</text>
+    <line x1="35" y1="106.66666666666667" x2="245" y2="106.66666666666667" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="110.66666666666667" font-size="9" fill="#9ca3af" text-anchor="end">260</text>
+    <line x1="35" y1="60.0" x2="245" y2="60.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+    <text x="30" y="64.0" font-size="9" fill="#9ca3af" text-anchor="end">280</text>
+    <rect x="55" y="95.58333333333333" width="40" height="104.41666666666667" fill="#3b82f6" rx="3"/>
+    <text x="75.0" y="89.58333333333333" class="bar-text" font-weight="bold">264.8</text>
+    <text x="75.0" y="215" class="bar-text">seed 42</text>
+    <rect x="110" y="141.66666666666666" width="40" height="58.333333333333336" fill="#10b981" rx="3"/>
+    <text x="130.0" y="135.66666666666666" class="bar-text" font-weight="bold">245.0</text>
+    <text x="130.0" y="215" class="bar-text">seed 100</text>
+    <rect x="165" y="149.83333333333334" width="40" height="50.166666666666664" fill="#8b5cf6" rx="3"/>
+    <text x="185.0" y="143.83333333333334" class="bar-text" font-weight="bold">241.5</text>
+    <text x="185.0" y="215" class="bar-text">seed 2026</text>
+    <text x="130.0" y="232" font-size="10" fill="#4b5563" text-anchor="middle">mean: 250.4 | std: 12.5</text>
+  </g>
+</svg>
