@@ -30,5 +30,7 @@ results/*
 !results/.gitkeep
 checkpoints/
 artifacts/
+models/
 *.pt
 *.pth
+*.zip
