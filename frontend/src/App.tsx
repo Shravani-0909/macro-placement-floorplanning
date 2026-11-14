@@ -15,15 +15,47 @@ interface Netlist {
 interface JobStatus {
   run_id: string; status: string; progress: number; step: number; total_steps: number
   current_hpwl: number | null; placement: Placed[]; error: string | null
+  current_congestion?: number | null; current_objective?: number | null
+  congestion?: number | null; objective?: number | null
+}
+interface TracePoint {
+  step: number
+  hpwl: number
+  congestion?: number | null
+  objective?: number | null
 }
 interface RunRec {
   alg: string; status: Status; runId: string | null; seed: number; netlist: Netlist
   progress: number; step: number; total: number; hpwl: number | null
+  congestion: number | null; objective: number | null
   placement: Placed[]; error: string | null; elapsedMs: number | null
+  trace: TracePoint[]
 }
 interface MacroRow { id: string; w: string; h: string }
 interface NetRow { id: string; ids: string; weight: string }
-interface HistoryRow { run_id: string; status: string; progress: number; current_hpwl: number | null; placement: Placed[]; error: string | null }
+interface HistoryRow {
+  run_id: string; status: string; progress: number
+  current_hpwl: number | null; current_congestion?: number | null; current_objective?: number | null
+  placement: Placed[]; error: string | null
+}
+interface RudyData {
+  run_id?: string
+  grid_w: number
+  grid_h: number
+  demand: number[][]
+  congestion_score: number
+  max_demand: number
+}
+interface BenchmarkSummary {
+  name: string
+  grid_w: number
+  grid_h: number
+  macro_count: number
+  net_count: number
+  total_macro_area: number
+  grid_area: number
+  area_utilization: number
+}
 
 /* ───────────────────────── Constants & defaults ───────────────────────── */
 const DEFAULT_API = 'http://127.0.0.1:8000'
@@ -179,8 +211,9 @@ async function runOne(
   signal: AbortSignal, patch: (p: Partial<RunRec>) => void,
 ) {
   const t0 = performance.now()
+  const trace: TracePoint[] = []
   try {
-    patch({ status: 'submitting' })
+    patch({ status: 'submitting', trace: [] })
     const start = await api<{ run_id: string }>(base, '/api/placements/run', {
       method: 'POST', body: JSON.stringify({ netlist: nl, algorithm: alg, seed, params }), signal,
     })
@@ -199,10 +232,20 @@ async function runOne(
         continue
       }
       const done = js.status === 'completed' || js.status === 'failed'
+      const hpwl = js.current_hpwl ?? null
+      const congestion = js.current_congestion ?? js.congestion ?? null
+      const objective = js.current_objective ?? js.objective ?? null
+
+      if (hpwl != null && (trace.length === 0 || trace[trace.length - 1].step !== js.step || trace[trace.length - 1].hpwl !== hpwl)) {
+        trace.push({ step: js.step, hpwl, congestion, objective })
+      }
+
       patch({
         status: (['pending', 'running', 'completed', 'failed'].includes(js.status) ? js.status : 'running') as Status,
-        progress: js.progress, step: js.step, total: js.total_steps, hpwl: js.current_hpwl,
+        progress: js.progress, step: js.step, total: js.total_steps,
+        hpwl, congestion, objective,
         placement: js.placement ?? [], error: js.error,
+        trace: [...trace],
         ...(done ? { elapsedMs: performance.now() - t0 } : {}),
       })
       if (done) return
@@ -214,9 +257,12 @@ async function runOne(
   }
 }
 
-/* ───────────────────────── SVG floorplan ───────────────────────── */
-function Floorplan({ nl, placement, showGrid, showNets, showLabels, compact }: {
-  nl: Netlist; placement: Placed[]; showGrid: boolean; showNets: boolean; showLabels: boolean; compact?: boolean
+/* ───────────────────────── SVG Floorplan & Heatmap ───────────────────────── */
+function Floorplan({
+  nl, placement, showGrid, showNets, showLabels, showHeatmap, rudy, compact,
+}: {
+  nl: Netlist; placement: Placed[]; showGrid: boolean; showNets: boolean; showLabels: boolean
+  showHeatmap?: boolean; rudy?: RudyData | null; compact?: boolean
 }) {
   const { grid_w: W, grid_h: H } = nl
   const p = Math.max(W, H) * 0.075
@@ -230,30 +276,64 @@ function Floorplan({ nl, placement, showGrid, showNets, showLabels, compact }: {
   }
   const ticks = (n: number) => Array.from({ length: Math.floor(n / step) + 1 }, (_, i) => i * step)
   const minor = W * H <= 2500
+
   return (
     <svg className="fp-svg" viewBox={`${-p} ${-p} ${W + p * 1.5} ${H + p * 1.5}`} role="img"
       aria-label={`Floorplan ${W} by ${H} grid with ${placement.length} placed macros`}>
       <rect x={0} y={0} width={W} height={H} className="fp-chip" />
+
+      {/* RUDY Wire Density Heatmap Cells */}
+      {showHeatmap && rudy && rudy.demand && rudy.demand.map((row, y) =>
+        row.map((val, x) => {
+          if (val <= 0.001) return null
+          const maxD = rudy.max_demand > 0 ? rudy.max_demand : 1.0
+          const ratio = Math.min(1.0, val / maxD)
+          // Gradient from transparent blue (220) to orange-red (0)
+          const hueVal = Math.max(0, 220 - ratio * 220)
+          const alpha = 0.2 + ratio * 0.65
+          return (
+            <rect
+              key={`rudy-${x}-${y}`}
+              x={x}
+              y={y}
+              width={1}
+              height={1}
+              fill={`hsla(${hueVal}, 95%, 48%, ${alpha})`}
+              vectorEffect="non-scaling-stroke"
+            >
+              <title>{`Cell (${x}, ${y}): RUDY wire demand = ${val.toFixed(2)}`}</title>
+            </rect>
+          )
+        })
+      )}
+
       {showGrid && (
         <g>
           {minor && Array.from({ length: W - 1 }, (_, i) => <line key={`vx${i}`} x1={i + 1} y1={0} x2={i + 1} y2={H} className="fp-minor" vectorEffect="non-scaling-stroke" />)}
           {minor && Array.from({ length: H - 1 }, (_, i) => <line key={`hy${i}`} x1={0} y1={i + 1} x2={W} y2={i + 1} className="fp-minor" vectorEffect="non-scaling-stroke" />)}
           {ticks(W).map((t) => <line key={`mx${t}`} x1={t} y1={0} x2={t} y2={H} className="fp-major" vectorEffect="non-scaling-stroke" />)}
-          {ticks(H).map((t) => <line key={`my${t}`} x1={0} y1={t} x2={W} y2={t} className="fp-major" vectorEffect="non-scaling-stroke" />)}
+          {ticks(H).map((t) => <line key={`my${t}`} x1={0} y1={t} x2={t} y2={H} className="fp-major" vectorEffect="non-scaling-stroke" />)}
         </g>
       )}
+
       {!compact && ticks(W).map((t) => <text key={`tx${t}`} x={t} y={-fs * 0.5} fontSize={fs} textAnchor="middle" className="fp-tick">{t}</text>)}
       {!compact && ticks(H).map((t) => <text key={`ty${t}`} x={-fs * 0.5} y={t + fs * 0.35} fontSize={fs} textAnchor="end" className="fp-tick">{t}</text>)}
+
+      {/* Macros */}
       {placement.map((q) => {
         const m = dims.get(q.macro_id)
         if (!m) return null
         const label = `M${m.id}`
         const f = Math.min(m.h * 0.34, m.w / (label.length * 0.62))
         const two = m.h >= 3 && m.w >= 3.5 && !compact
+        const macroOpacity = showHeatmap ? 0.88 : 0.94
         return (
           <g key={q.macro_id}>
             <rect x={q.x} y={q.y} width={m.w} height={m.h} rx={Math.min(m.w, m.h) * 0.06}
-              fill={`hsl(${hue(m.id)} 62% 62% / 0.92)`} className="fp-macro" vectorEffect="non-scaling-stroke">
+              fill={`hsl(${hue(m.id)} 62% 62% / ${macroOpacity})`}
+              stroke={showHeatmap ? '#ffffff' : 'currentColor'}
+              strokeWidth={showHeatmap ? Math.max(0.2, Math.min(W, H) * 0.006) : undefined}
+              className="fp-macro" vectorEffect="non-scaling-stroke">
               <title>{`Macro ${m.id}: ${m.w}×${m.h} at (${q.x}, ${q.y})`}</title>
             </rect>
             {showLabels && f > 0.35 && (
@@ -265,6 +345,8 @@ function Floorplan({ nl, placement, showGrid, showNets, showLabels, compact }: {
           </g>
         )
       })}
+
+      {/* Nets */}
       {showNets && nl.nets.map((n) => {
         const cs = n.macro_ids.map(center).filter((c): c is { x: number; y: number } => c !== null)
         if (cs.length < 2) return null
@@ -283,11 +365,72 @@ function Floorplan({ nl, placement, showGrid, showNets, showLabels, compact }: {
   )
 }
 
-/* ───────────────────────── App ───────────────────────── */
+/* ───────────────────────── Optimization Trace / Convergence Chart ───────────────────────── */
+function ConvergenceChart({ trace, totalSteps, compact }: { trace: TracePoint[]; totalSteps: number; compact?: boolean }) {
+  if (trace.length === 0) return null
+
+  const W = compact ? 260 : 540
+  const H = compact ? 110 : 160
+  const padL = compact ? 36 : 46
+  const padR = 14
+  const padT = 16
+  const padB = compact ? 22 : 28
+
+  const plotW = W - padL - padR
+  const plotH = H - padT - padB
+
+  const maxStep = Math.max(totalSteps, ...trace.map((p) => p.step), 1)
+  const hpwls = trace.map((p) => p.hpwl)
+  const minH = Math.min(...hpwls)
+  const maxH = Math.max(...hpwls)
+  const hRange = maxH - minH > 0.001 ? maxH - minH : 1.0
+
+  const scaleX = (s: number) => padL + (s / maxStep) * plotW
+  const scaleY = (v: number) => padT + plotH - ((v - minH) / hRange) * plotH
+
+  const pts = trace.map((p) => `${scaleX(p.step).toFixed(1)},${scaleY(p.hpwl).toFixed(1)}`).join(' ')
+
+  return (
+    <div className="trace-chart">
+      <div className="trace-head">
+        <strong>Optimization Convergence Curve</strong>
+        <span className="hint">HPWL: initial {fmt(trace[0]?.hpwl, 1)} → best {fmt(minH, 1)}</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="chart-svg" role="img" aria-label="Convergence chart">
+        {/* Background gridlines */}
+        <line x1={padL} y1={padT} x2={padL + plotW} y2={padT} stroke="var(--border)" strokeDasharray="3 3" />
+        <line x1={padL} y1={padT + plotH / 2} x2={padL + plotW} y2={padT + plotH / 2} stroke="var(--border)" strokeDasharray="3 3" />
+        <line x1={padL} y1={padT + plotH} x2={padL + plotW} y2={padT + plotH} stroke="var(--border)" />
+        <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="var(--border)" />
+
+        {/* Y Axis ticks */}
+        <text x={padL - 6} y={padT + 4} textAnchor="end" className="chart-tick">{fmt(maxH, 0)}</text>
+        <text x={padL - 6} y={padT + plotH} textAnchor="end" className="chart-tick">{fmt(minH, 0)}</text>
+
+        {/* X Axis ticks */}
+        <text x={padL} y={H - 5} textAnchor="start" className="chart-tick">Step 0</text>
+        <text x={padL + plotW} y={H - 5} textAnchor="end" className="chart-tick">Step {maxStep}</text>
+
+        {/* Polyline */}
+        <polyline fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" points={pts} />
+
+        {/* Trace dots */}
+        {trace.map((p, i) => (
+          <circle key={i} cx={scaleX(p.step)} cy={scaleY(p.hpwl)} r={compact ? 2.5 : 3.5} fill="var(--accent)" stroke="#ffffff" strokeWidth="1">
+            <title>{`Step ${p.step}: HPWL ${p.hpwl.toFixed(1)}${p.congestion != null ? `, Congestion ${p.congestion.toFixed(2)}` : ''}`}</title>
+          </circle>
+        ))}
+      </svg>
+    </div>
+  )
+}
+
+/* ───────────────────────── Main App ───────────────────────── */
 export default function App() {
   const [apiUrl, setApiUrl] = useState(DEFAULT_API)
   const [conn, setConn] = useState<{ state: 'checking' | 'ok' | 'down'; msg: string }>({ state: 'checking', msg: 'Checking…' })
   const [registry, setRegistry] = useState<string[] | null>(null)
+  const [benchmarks, setBenchmarks] = useState<BenchmarkSummary[]>([])
 
   const [gw, setGw] = useState('20')
   const [gh, setGh] = useState('16')
@@ -306,6 +449,8 @@ export default function App() {
   const [showGrid, setShowGrid] = useState(true)
   const [showNets, setShowNets] = useState(true)
   const [showLabels, setShowLabels] = useState(true)
+  const [showHeatmap, setShowHeatmap] = useState(false)
+  const [rudyData, setRudyData] = useState<Record<string, RudyData>>({})
   const [history, setHistory] = useState<HistoryRow[] | null>(null)
   const [histErr, setHistErr] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -317,8 +462,7 @@ export default function App() {
   const rlKey = registry?.find((n) => RL_RE.test(n)) ?? null
   const isAvail = (k: string) => (registry ? registry.includes(k) : true)
 
-  /* connection + registry discovery: an invalid-algorithm POST is rejected with HTTP 400 that lists the real
-     registry, and no job is created. */
+  /* connection, algorithm registry, and benchmark suites discovery */
   const checkApi = useCallback(async () => {
     setConn({ state: 'checking', msg: 'Checking…' })
     try {
@@ -329,20 +473,37 @@ export default function App() {
       setRegistry(null)
       return
     }
+
+    // Try direct algorithms endpoint first
     try {
-      await api(base, '/api/placements/run', {
-        method: 'POST',
-        body: JSON.stringify({
-          algorithm: '__registry_probe__', seed: 0, params: {},
-          netlist: { version: '1.0', grid_w: 2, grid_h: 1, macros: [{ id: 0, w: 1, h: 1 }, { id: 1, w: 1, h: 1 }], nets: [{ id: 0, macro_ids: [0, 1], weight: 1 }] },
-        }),
-      })
-      setRegistry(null)
-    } catch (e) {
-      const m = errMsg(e).match(/Available:\s*\[([^\]]*)\]/)
-      setRegistry(m ? [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]) : null)
+      const algRes = await api<{ algorithms: string[] }>(base, '/api/algorithms')
+      setRegistry(algRes.algorithms)
+    } catch {
+      // Fallback probe
+      try {
+        await api(base, '/api/placements/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            algorithm: '__registry_probe__', seed: 0, params: {},
+            netlist: { version: '1.0', grid_w: 2, grid_h: 1, macros: [{ id: 0, w: 1, h: 1 }, { id: 1, w: 1, h: 1 }], nets: [{ id: 0, macro_ids: [0, 1], weight: 1 }] },
+          }),
+        })
+        setRegistry(null)
+      } catch (e) {
+        const m = errMsg(e).match(/Available:\s*\[([^\]]*)\]/)
+        setRegistry(m ? [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]) : null)
+      }
+    }
+
+    // Load available standard benchmarks
+    try {
+      const bm = await api<{ benchmarks: BenchmarkSummary[] }>(base, '/api/benchmarks')
+      setBenchmarks(bm.benchmarks ?? [])
+    } catch {
+      setBenchmarks([])
     }
   }, [base])
+
   useEffect(() => {
     const t = setTimeout(() => void checkApi(), 400)
     return () => clearTimeout(t)
@@ -350,9 +511,9 @@ export default function App() {
 
   /* run orchestration */
   const params = (a: string): Record<string, unknown> =>
-    a === 'sa'
-      ? { max_iterations: toInt(saIter), initial_temperature: toNum(saTemp), cooling_rate: toNum(saCool) }
-      : {}
+    a === 'sa' || a === 'simulated_annealing'
+      ? { max_iterations: toInt(saIter), initial_temperature: toNum(saTemp), cooling_rate: toNum(saCool), alpha: 1.0, beta: 1.0 }
+      : { alpha: 1.0, beta: 1.0 }
 
   const runBatch = async (algs: string[]) => {
     if (busy) return
@@ -360,7 +521,7 @@ export default function App() {
     if (!nl) return setNotice({ kind: 'error', lines: built.errors })
     const sd = toInt(seed)
     if (Number.isNaN(sd)) return setNotice({ kind: 'error', lines: ['Seed must be an integer.'] })
-    if (algs.includes('sa')) {
+    if (algs.includes('sa') || algs.includes('simulated_annealing')) {
       const it = toInt(saIter), t = toNum(saTemp), c = toNum(saCool)
       const bad = [!(it > 0) && 'SA max iterations must be a positive integer.', !(t > 0) && 'SA initial temperature must be > 0.', !(c > 0 && c < 1) && 'SA cooling rate must be between 0 and 1 (exclusive).'].filter(Boolean) as string[]
       if (bad.length) return setNotice({ kind: 'error', lines: bad })
@@ -369,7 +530,11 @@ export default function App() {
     const ac = new AbortController()
     abortRef.current = ac
     setBusy(algs.length > 1 ? 'compare' : 'single')
-    const blank = (a: string): RunRec => ({ alg: a, status: 'idle', runId: null, seed: sd, netlist: nl, progress: 0, step: 0, total: nl.macros.length, hpwl: null, placement: [], error: null, elapsedMs: null })
+    const blank = (a: string): RunRec => ({
+      alg: a, status: 'idle', runId: null, seed: sd, netlist: nl,
+      progress: 0, step: 0, total: nl.macros.length, hpwl: null,
+      congestion: null, objective: null, placement: [], error: null, elapsedMs: null, trace: [],
+    })
     setRuns((r) => { const n = { ...r }; algs.forEach((a) => (n[a] = blank(a))); return n })
     for (const a of algs) {
       setView(a)
@@ -379,6 +544,7 @@ export default function App() {
     }
     setBusy(null)
   }
+
   const compareAlgs = [...ALGS.map((a) => a.key).filter(isAvail), ...(rlKey ? [rlKey] : [])]
   const allKeys = [...ALGS.map((a) => a.key), rlKey ?? 'rl']
 
@@ -406,6 +572,19 @@ export default function App() {
   const addNet = () => setNets((n) => [...n, { id: nextId(n), ids: '', weight: '1' }])
   const resetExample = () => { setGw('20'); setGh('16'); setMacros(DEFAULT_MACROS); setNets(DEFAULT_NETS); setSeed('42'); setNotice(null) }
 
+  const loadBenchmarkPreset = async (name: string) => {
+    try {
+      const nl = await api<Netlist>(base, `/api/benchmarks/${name}`)
+      setGw(String(nl.grid_w))
+      setGh(String(nl.grid_h))
+      setMacros(nl.macros.map((m) => ({ id: String(m.id), w: String(m.w), h: String(m.h) })))
+      setNets(nl.nets.map((x) => ({ id: String(x.id), ids: x.macro_ids.join(', '), weight: String(x.weight ?? 1) })))
+      setNotice({ kind: 'ok', lines: [`Loaded benchmark preset '${name}': ${nl.macros.length} macros, ${nl.nets.length} nets, ${nl.grid_w}×${nl.grid_h} grid.`] })
+    } catch (e) {
+      setNotice({ kind: 'error', lines: [`Failed to load benchmark '${name}': ${errMsg(e)}`] })
+    }
+  }
+
   const importNetlist = (e: ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     e.target.value = ''
@@ -431,15 +610,32 @@ export default function App() {
   const issues = rec?.status === 'completed' ? checkLegal(rec.netlist, rec.placement) : []
   const running = !!rec && ['submitting', 'pending', 'running'].includes(rec.status)
 
+  /* Fetch RUDY data when a placement is completed */
+  const activeRunId = rec?.runId
+  useEffect(() => {
+    if (rec?.status === 'completed' && activeRunId && !rudyData[activeRunId]) {
+      api<RudyData>(base, `/api/placements/${activeRunId}/rudy`)
+        .then((data) => setRudyData((prev) => ({ ...prev, [activeRunId]: data })))
+        .catch(() => { /* silent fallback */ })
+    }
+  }, [rec?.status, activeRunId, base, rudyData])
+
+  const curRudy = activeRunId ? rudyData[activeRunId] : null
+
   /* exports */
   const exportable = Object.values(runs).filter((r) => r.status === 'completed')
   const exportJson = () => download('macro-placement-results.json', 'application/json', JSON.stringify({
     exported_at: new Date().toISOString(), api_url: base,
     results: Object.values(runs).filter((r) => r.status === 'completed' || r.status === 'failed').map((r) => ({
-      algorithm: r.alg, run_id: r.runId, status: r.status, seed: r.seed, hpwl: r.status === 'completed' ? r.hpwl : null,
-      steps: r.step, total_steps: r.total, client_wall_time_ms: r.elapsedMs, error: r.error, netlist: r.netlist, placement: r.placement,
+      algorithm: r.alg, run_id: r.runId, status: r.status, seed: r.seed,
+      hpwl: r.status === 'completed' ? r.hpwl : null,
+      congestion: r.status === 'completed' ? r.congestion : null,
+      objective: r.status === 'completed' ? r.objective : null,
+      steps: r.step, total_steps: r.total, client_wall_time_ms: r.elapsedMs, error: r.error,
+      netlist: r.netlist, placement: r.placement,
     })),
   }, null, 2))
+
   const exportPlacementsCsv = () => {
     const rows = ['algorithm,run_id,macro_id,x,y,w,h']
     exportable.forEach((r) => r.placement.forEach((q) => {
@@ -448,11 +644,19 @@ export default function App() {
     }))
     download('macro-placements.csv', 'text/csv', rows.join('\n') + '\n')
   }
+
   const exportMetricsCsv = () => {
-    const rows = ['algorithm,status,run_id,seed,hpwl,steps,total_steps,client_wall_time_ms,error']
-    Object.values(runs).forEach((r) => rows.push([r.alg, r.status, r.runId, r.seed, r.status === 'completed' ? r.hpwl : '', r.step, r.total, r.elapsedMs?.toFixed(1), r.error].map(csv).join(',')))
+    const rows = ['algorithm,status,run_id,seed,hpwl,congestion,objective,steps,total_steps,client_wall_time_ms,error']
+    Object.values(runs).forEach((r) => rows.push([
+      r.alg, r.status, r.runId, r.seed,
+      r.status === 'completed' ? r.hpwl : '',
+      r.status === 'completed' ? r.congestion : '',
+      r.status === 'completed' ? r.objective : '',
+      r.step, r.total, r.elapsedMs?.toFixed(1), r.error,
+    ].map(csv).join(',')))
     download('macro-metrics.csv', 'text/csv', rows.join('\n') + '\n')
   }
+
   const exportNetlist = () => built.netlist
     ? download('netlist.json', 'application/json', JSON.stringify(built.netlist, null, 2))
     : setNotice({ kind: 'error', lines: built.errors })
@@ -482,6 +686,27 @@ export default function App() {
               <input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} spellCheck={false} />
             </label>
             <p className="hint">{registry ? <>Backend algorithms: <code>{registry.join(', ')}</code></> : 'Backend algorithm list unavailable.'}</p>
+          </section>
+
+          {/* Standard Benchmark Presets */}
+          <section className="panel">
+            <h2>Standard Benchmarks</h2>
+            <p className="hint">Select a synthetic benchmark to auto-fill the grid and circuit:</p>
+            <div className="btn-row wrap">
+              {benchmarks.length > 0 ? (
+                benchmarks.map((b) => (
+                  <button key={b.name} className="btn sm" onClick={() => void loadBenchmarkPreset(b.name)}>
+                    {b.name} ({b.macro_count}m)
+                  </button>
+                ))
+              ) : (
+                <>
+                  <button className="btn sm" onClick={() => void loadBenchmarkPreset('toy_4')}>toy_4 (4m)</button>
+                  <button className="btn sm" onClick={() => void loadBenchmarkPreset('medium_8')}>medium_8 (8m)</button>
+                  <button className="btn sm" onClick={() => void loadBenchmarkPreset('dense_10')}>dense_10 (10m)</button>
+                </>
+              )}
+            </div>
           </section>
 
           <section className="panel">
@@ -534,7 +759,7 @@ export default function App() {
             </label>
             {!rlKey && <p className="hint">RL is not registered in the backend’s algorithm registry, so it cannot be run.</p>}
             <label className="field"><span>Random seed</span><input inputMode="numeric" value={seed} onChange={(e) => setSeed(e.target.value)} /></label>
-            {alg === 'sa'
+            {alg === 'sa' || alg === 'simulated_annealing'
               ? (
                 <div className="row3">
                   <label className="field"><span>Max iters</span><input value={saIter} onChange={(e) => setSaIter(e.target.value)} /></label>
@@ -560,7 +785,7 @@ export default function App() {
           </section>
         </aside>
 
-        {/* ───────── Main ───────── */}
+        {/* ───────── Main Content ───────── */}
         <main className="main">
           {notice && (
             <div className={`banner banner-${notice.kind}`} role="alert">
@@ -578,7 +803,7 @@ export default function App() {
                 {busy === 'compare' ? 'Comparing…' : `⇄ Compare ${compareAlgs.length} algorithms`}
               </button>
               <button className="btn" disabled={!busy} onClick={() => abortRef.current?.abort()}>■ Cancel</button>
-              <button className="btn" disabled={!!busy || !hasRuns} onClick={() => { setRuns({}); setNotice(null) }}>Clear results</button>
+              <button className="btn" disabled={!!busy || !hasRuns} onClick={() => { setRuns({}); setRudyData({}); setNotice(null) }}>Clear results</button>
             </div>
             <p className="hint">Compare runs {compareAlgs.map(algLabel).join(', ')} sequentially on the same netlist, seed and parameters. Elapsed time is measured in your browser (submit → finished).</p>
           </section>
@@ -601,23 +826,51 @@ export default function App() {
                 <label><input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Grid</label>
                 <label><input type="checkbox" checked={showNets} onChange={(e) => setShowNets(e.target.checked)} /> Nets</label>
                 <label><input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} /> Labels</label>
+                <label><input type="checkbox" checked={showHeatmap} onChange={(e) => setShowHeatmap(e.target.checked)} /> RUDY Heatmap</label>
               </div>
             </div>
 
             <div className="stage">
-              <Floorplan nl={shownNl} placement={rec?.placement ?? []} showGrid={showGrid} showNets={showNets} showLabels={showLabels} />
-              {!rec && <div className="overlay"><strong>No placement yet</strong><span>Configure a netlist and press Run. Only placements returned by the API are drawn.</span></div>}
+              <Floorplan
+                nl={shownNl}
+                placement={rec?.placement ?? []}
+                showGrid={showGrid}
+                showNets={showNets}
+                showLabels={showLabels}
+                showHeatmap={showHeatmap}
+                rudy={curRudy}
+              />
+              {!rec && <div className="overlay"><strong>No placement yet</strong><span>Configure a netlist and press Run. Placements and RUDY density maps are rendered from API responses.</span></div>}
               {rec && running && <div className="overlay light"><div className="spinner" /><span>{rec.status === 'submitting' ? 'Submitting…' : `${algLabel(rec.alg)} · ${Math.round(rec.progress * 100)}% (step ${rec.step}/${rec.total})`}</span></div>}
               {rec?.status === 'failed' && <div className="overlay err"><strong>Run failed</strong><span>{rec.error}</span></div>}
               {rec?.status === 'cancelled' && <div className="overlay"><strong>Cancelled</strong><span>{rec.error}</span></div>}
               {rec?.status === 'completed' && rec.placement.length === 0 && <div className="overlay"><strong>Empty result</strong><span>The API returned no placed macros.</span></div>}
             </div>
+
+            {showHeatmap && curRudy && (
+              <div className="heatmap-legend">
+                <span>RUDY Wire Demand:</span>
+                <span className="heat-box low">0.0 (low)</span>
+                <div className="heatmap-bar" />
+                <span className="heat-box high">{curRudy.max_demand.toFixed(1)} (hotspot)</span>
+                <span className="hint">· Congestion score C_score: <strong>{curRudy.congestion_score.toFixed(3)}</strong></span>
+              </div>
+            )}
+
             {rec && stale(rec) && <p className="warn-text">⚠ The configuration changed since this result was produced; the layout shows the original netlist.</p>}
             <p className="hint">Origin (0, 0) is the top-left corner; x grows right, y grows down. Net lines run from each net’s centroid to its macro centers.</p>
+
+            {/* Optimization Convergence Curve */}
+            {rec?.trace && rec.trace.length > 1 && (
+              <ConvergenceChart trace={rec.trace} totalSteps={rec.total} />
+            )}
           </section>
 
+          {/* Metric Cards (Expanded for HPWL, Congestion, and Combined Objective) */}
           <section className="cards">
             <div className="card"><span>HPWL{rec && rec.status !== 'completed' ? ' (partial)' : ''}</span><strong>{fmt(rec?.hpwl)}</strong></div>
+            <div className="card"><span>Congestion (C_score)</span><strong>{fmt(rec?.congestion, 3)}</strong></div>
+            <div className="card"><span>Objective J(P)</span><strong>{fmt(rec?.objective, 3)}</strong></div>
             <div className="card"><span>Status</span><strong>{rec ? <span className={stCls(rec.status)}>{rec.status}</span> : '—'}</strong></div>
             <div className="card"><span>Progress</span><strong>{rec ? `${rec.step}/${rec.total}` : '—'}</strong>{rec && <div className="bar"><i style={{ width: `${rec.progress * 100}%` }} /></div>}</div>
             <div className="card"><span>Elapsed (client)</span><strong>{fmtMs(rec?.elapsedMs ?? null)}</strong></div>
@@ -632,6 +885,7 @@ export default function App() {
               {allKeys.map((k) => {
                 const r = runs[k]
                 const na = (RL_RE.test(k) && !rlKey) || !isAvail(k)
+                const rRudy = r?.runId ? rudyData[r.runId] : null
                 return (
                   <article key={k} className={`cmp ${r?.status === 'completed' && r.hpwl === best && finished.length > 1 ? 'best' : ''} ${na ? 'na' : ''}`}>
                     <header><strong>{algLabel(k)}</strong>{na ? <span className="st st-na">unavailable</span> : <span className={stCls(r?.status ?? 'idle')}>{r?.status ?? 'not run'}</span>}</header>
@@ -639,8 +893,28 @@ export default function App() {
                       <p className="hint">{RL_RE.test(k) ? 'Not registered in the backend registry (src/placement/jobs.py), so no RL result is shown.' : 'Not registered in the backend.'}</p>
                     ) : r ? (
                       <>
-                        <Floorplan nl={r.netlist} placement={r.placement} showGrid={showGrid} showNets={false} showLabels={showLabels} compact />
-                        <div className="cmp-meta"><span>HPWL</span><strong>{r.status === 'completed' ? fmt(r.hpwl) : '—'}</strong></div>
+                        <Floorplan
+                          nl={r.netlist}
+                          placement={r.placement}
+                          showGrid={showGrid}
+                          showNets={false}
+                          showLabels={showLabels}
+                          showHeatmap={showHeatmap}
+                          rudy={rRudy}
+                          compact
+                        />
+                        <div className="cmp-meta">
+                          <span>HPWL</span><strong>{r.status === 'completed' ? fmt(r.hpwl) : '—'}</strong>
+                        </div>
+                        <div className="cmp-meta">
+                          <span>Congestion</span><strong>{r.status === 'completed' ? fmt(r.congestion, 2) : '—'}</strong>
+                        </div>
+                        <div className="cmp-meta">
+                          <span>Objective</span><strong>{r.status === 'completed' ? fmt(r.objective, 2) : '—'}</strong>
+                        </div>
+                        {r.trace.length > 1 && (
+                          <ConvergenceChart trace={r.trace} totalSteps={r.total} compact />
+                        )}
                         {r.status === 'failed' && <p className="err-text">{r.error}</p>}
                         <button className="btn sm" onClick={() => setView(k)}>View large</button>
                       </>
@@ -652,7 +926,19 @@ export default function App() {
 
             <div className="table-wrap">
               <table className="metrics">
-                <thead><tr><th>Algorithm</th><th>Status</th><th className="num">HPWL</th><th className="num">vs best</th><th className="num">Steps</th><th className="num">Elapsed (client)</th><th>Run ID</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th>Algorithm</th>
+                    <th>Status</th>
+                    <th className="num">HPWL</th>
+                    <th className="num">Congestion</th>
+                    <th className="num">Objective J(P)</th>
+                    <th className="num">vs best</th>
+                    <th className="num">Steps</th>
+                    <th className="num">Elapsed</th>
+                    <th>Run ID</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {allKeys.map((k) => {
                     const r = runs[k]
@@ -663,6 +949,8 @@ export default function App() {
                         <td>{algLabel(k)}</td>
                         <td>{na ? <span className="st st-na">unavailable</span> : <span className={stCls(r?.status ?? 'idle')}>{r?.status ?? 'not run'}</span>}</td>
                         <td className="num">{ok ? fmt(r.hpwl) : '—'}</td>
+                        <td className="num">{ok ? fmt(r.congestion, 3) : '—'}</td>
+                        <td className="num">{ok ? fmt(r.objective, 3) : '—'}</td>
                         <td className="num">{ok && best != null && best > 0 ? (r.hpwl === best ? 'best' : `+${(((r.hpwl as number) / best - 1) * 100).toFixed(1)}%`) : '—'}</td>
                         <td className="num">{r ? `${r.step}/${r.total}` : '—'}</td>
                         <td className="num">{fmtMs(r?.elapsedMs ?? null)}</td>
@@ -673,7 +961,7 @@ export default function App() {
                 </tbody>
               </table>
             </div>
-            <p className="hint">Only values returned by the API are shown. The API reports no congestion or convergence data, so none is displayed.</p>
+            <p className="hint">All metrics (HPWL, RUDY Congestion score, and combined objective J(P) = α·HPWL + β·C_score) are computed via canonical PlacementEngine objectives.</p>
           </section>
 
           {/* ───────── Export ───────── */}

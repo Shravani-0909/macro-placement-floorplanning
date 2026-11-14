@@ -3,7 +3,10 @@
 from .benchmarks import (
     BenchmarkRunResult,
     BenchmarkSummary,
+    generate_benchmark_netlist,
+    get_connectivity_benchmark_suite,
     get_default_benchmark_suite,
+    get_scaling_benchmark_suite,
     run_benchmark_suite,
 )
 from .constraints import (
@@ -33,6 +36,7 @@ from .hpwl import (
 from .jobs import (
     default_greedy_placement_runner,
     default_random_placement_runner,
+    default_rl_placement_runner,
     default_sa_placement_runner,
     get_registered_algorithms,
     register_algorithm,
@@ -52,6 +56,7 @@ __all__ = [
     "DuplicateMacroError",
     "default_greedy_placement_runner",
     "default_random_placement_runner",
+    "default_rl_placement_runner",
     "default_sa_placement_runner",
     "IncompletePlacementError",
     "Macro",
@@ -70,9 +75,12 @@ __all__ = [
     "calculate_net_hpwls",
     "coord_to_action",
     "find_overlapping_macro",
+    "generate_benchmark_netlist",
+    "get_connectivity_benchmark_suite",
     "get_default_benchmark_suite",
     "get_macro_center",
     "get_registered_algorithms",
+    "get_scaling_benchmark_suite",
     "is_within_boundary",
     "macros_overlap",
     "placement_to_dict",

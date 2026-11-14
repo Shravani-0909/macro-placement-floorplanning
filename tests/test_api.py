@@ -341,3 +341,86 @@ async def test_run_simulated_annealing_alias_via_api(valid_netlist_payload: dict
         await asyncio.sleep(0.02)
 
     assert job["status"] == "completed"
+
+
+@async_test
+async def test_list_algorithms() -> None:
+    """GET /api/algorithms returns all registered algorithms."""
+    status_code, body = await asgi_request("GET", "/api/algorithms")
+    assert status_code == 200
+    assert "algorithms" in body
+    algs = set(body["algorithms"])
+    assert {"random", "greedy", "sa", "simulated_annealing", "rl"}.issubset(algs)
+
+
+@async_test
+async def test_list_and_get_benchmarks() -> None:
+    """GET /api/benchmarks and GET /api/benchmarks/{name} return valid benchmarks."""
+    status_code, body = await asgi_request("GET", "/api/benchmarks")
+    assert status_code == 200
+    assert "benchmarks" in body
+    names = {b["name"] for b in body["benchmarks"]}
+    assert {"toy_4", "medium_8", "dense_10"}.issubset(names)
+
+    status_code, toy_nl = await asgi_request("GET", "/api/benchmarks/toy_4")
+    assert status_code == 200
+    assert toy_nl["grid_w"] == 15
+    assert len(toy_nl["macros"]) == 4
+
+    status_code, _ = await asgi_request("GET", "/api/benchmarks/nonexistent")
+    assert status_code == 404
+
+
+@async_test
+async def test_rudy_endpoints(valid_netlist_payload: dict[str, Any]) -> None:
+    """Test POST /api/netlist/rudy and GET /api/placements/{run_id}/rudy."""
+    placement = [
+        {"macro_id": 0, "x": 0, "y": 0},
+        {"macro_id": 1, "x": 5, "y": 5},
+        {"macro_id": 2, "x": 10, "y": 10},
+    ]
+    status_code, body = await asgi_request(
+        "POST",
+        "/api/netlist/rudy",
+        json_body={"netlist": valid_netlist_payload, "placement": placement},
+    )
+    assert status_code == 200
+    assert body["grid_w"] == 20
+    assert body["grid_h"] == 20
+    assert len(body["demand"]) == 20
+    assert len(body["demand"][0]) == 20
+    assert "congestion_score" in body
+    assert body["congestion_score"] >= 0.0
+
+
+@async_test
+async def test_completed_job_has_congestion_and_objective(valid_netlist_payload: dict[str, Any]) -> None:
+    """Verify completed job status includes congestion and objective scores."""
+    payload = {
+        "netlist": valid_netlist_payload,
+        "algorithm": "greedy",
+        "seed": 42,
+        "params": {"alpha": 1.0, "beta": 1.0},
+    }
+    status_code, start_body = await asgi_request("POST", "/api/placements/run", json_body=payload)
+    assert status_code == 202
+    run_id = start_body["run_id"]
+
+    for _ in range(50):
+        _, job = await asgi_request("GET", f"/api/placements/{run_id}")
+        if job.get("status") in ("completed", "failed"):
+            break
+        await asyncio.sleep(0.02)
+
+    assert job["status"] == "completed"
+    assert job["current_hpwl"] is not None
+    assert job["current_congestion"] is not None
+    assert job["current_objective"] is not None
+    assert job["congestion"] == job["current_congestion"]
+    assert job["objective"] == job["current_objective"]
+
+    # Also test GET /api/placements/{run_id}/rudy
+    rudy_status, rudy_body = await asgi_request("GET", f"/api/placements/{run_id}/rudy")
+    assert rudy_status == 200
+    assert rudy_body["grid_w"] == 20
+    assert rudy_body["congestion_score"] == job["current_congestion"]

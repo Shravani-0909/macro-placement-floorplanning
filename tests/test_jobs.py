@@ -12,6 +12,7 @@ from src.placement.jobs import (
     JobManager,
     default_greedy_placement_runner,
     default_random_placement_runner,
+    default_rl_placement_runner,
     default_sa_placement_runner,
     get_registered_algorithms,
 )
@@ -435,5 +436,63 @@ async def test_job_manager_sa_rejects_boolean_shift_window(small_netlist: Netlis
     assert job is not None
     assert job.status == "failed"
     assert "shift_window must be a positive integer" in (job.error or "")
+
+
+def test_rl_algorithm_registered() -> None:
+    """RL algorithm is registered with the backend registry."""
+    registered = get_registered_algorithms()
+    assert "rl" in registered
+
+
+def test_rl_runner_graceful_fallback_without_gymnasium(small_netlist: Netlist) -> None:
+    """When Gymnasium is unavailable, RL runner raises PlacementError."""
+    from unittest.mock import patch
+    from src.placement.constraints import PlacementError
+    import src.algorithms.rl_placement as rlp
+
+    coro = default_rl_placement_runner(
+        netlist=small_netlist,
+        seed=42,
+        params={},
+        progress_cb=lambda p: asyncio.sleep(0),
+    )
+
+    with patch.object(rlp, "_HAS_GYMNASIUM", False):
+        with pytest.raises(PlacementError, match="gymnasium"):
+            try:
+                coro.send(None)
+            except StopIteration:
+                pass
+            finally:
+                coro.close()
+
+
+try:
+    import gymnasium
+    _HAS_GYM = True
+except ImportError:
+    _HAS_GYM = False
+
+
+@pytest.mark.skipif(not _HAS_GYM, reason="Gymnasium dependency unavailable")
+@async_test
+async def test_rl_placement_runner(small_netlist: Netlist) -> None:
+    """When Gymnasium is available, RL runner executes and produces a valid placement."""
+    progress_snapshots = []
+
+    async def on_progress(p: Any) -> None:
+        progress_snapshots.append(p)
+
+    placement = await default_rl_placement_runner(
+        netlist=small_netlist,
+        seed=42,
+        params={"alpha": 1.0, "beta": 1.0},
+        progress_cb=on_progress,
+    )
+
+    assert len(placement) == len(small_netlist.macros)
+    report = validate_placement(small_netlist, placement)
+    assert report.is_valid
+    assert report.is_complete
 
 

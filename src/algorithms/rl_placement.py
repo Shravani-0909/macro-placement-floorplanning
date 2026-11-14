@@ -1,9 +1,10 @@
-"""Reinforcement Learning Macro Placement using MaskablePPO and Gymnasium.
+"""Reinforcement Learning Macro Placement using PlacementEngine, MaskablePPO, and Gymnasium.
 
 This module provides:
-1. MacroPlacementEnv: Custom Gymnasium environment with action masking for sequential macro placement.
+1. MacroPlacementEnv: Custom Gymnasium environment wrapping the shared PlacementEngine
+   with canonical action masking, objective evaluation, and sequential placement.
 2. train_rl_agent: MaskablePPO training pipeline using MultiInputPolicy.
-3. solve: Unified solver interface compliant with the team contract and experiment runner.
+3. solve: Standardized solver interface compliant with the team contract.
 """
 
 from __future__ import annotations
@@ -12,189 +13,195 @@ import asyncio
 import inspect
 import math
 import os
+import random
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
-import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
 
-# Robust import for ActionMasker across sb3_contrib versions
+# Optional RL dependencies with informative error messages
 try:
-    from sb3_contrib.common.maskable.wrappers import ActionMasker
+    import gymnasium as gym
+    from gymnasium import spaces
+
+    _HAS_GYMNASIUM = True
 except ImportError:
-    from sb3_contrib.common.wrappers import ActionMasker  # type: ignore[no-redef]
+    gym = None  # type: ignore[assignment]
+    spaces = None  # type: ignore[assignment]
+    _HAS_GYMNASIUM = False
 
-from sb3_contrib import MaskablePPO
+try:
+    from sb3_contrib import MaskablePPO
+
+    try:
+        from sb3_contrib.common.maskable.wrappers import ActionMasker
+    except ImportError:
+        from sb3_contrib.common.wrappers import ActionMasker  # type: ignore[no-redef]
+    _HAS_SB3 = True
+except ImportError:
+    MaskablePPO = None  # type: ignore[assignment, misc]
+    ActionMasker = None  # type: ignore[assignment, misc]
+    _HAS_SB3 = False
+
+from src.algorithms.common import to_canonical_netlist
+from src.placement.constraints import validate_placement
+from src.placement.engine import PlacementEngine, action_to_coord, coord_to_action
+from src.placement.models import Macro, Netlist, PlacedMacro, Placement
+from src.placement.objective import EvaluationResult, evaluate_placement
+
+_BaseEnv: Any = gym.Env if gym is not None else object
 
 
-@dataclass
-class MacroSpec:
-    """Internal normalized representation of a macro to place."""
-
-    id: Any
-    w: int
-    h: int
-
-
-class MacroPlacementEnv(gym.Env):
-    """Custom Gymnasium Environment for sequential 2D VLSI Macro Placement.
+class MacroPlacementEnv(_BaseEnv):
+    """Gymnasium Environment adapter wrapping the canonical PlacementEngine.
 
     Conventions:
+    - Origin (0, 0) is top-left.
+    - Grid dimensions: width W = netlist.grid_w, height H = netlist.grid_h.
     - Discrete action index: a = y * W + x (0 <= a < W * H).
-    - Coordinate origin: (0, 0) is top-left.
+    - Coordinates: x = a % W, y = a // W (action_to_coord).
     - Observation: Dict containing:
-        - 'grid_occupancy': Box(0, 1, shape=(1, W, H), dtype=np.float32) for PyTorch CNNs.
-        - 'macro_features': Box(low=0, high=W, shape=(2,), dtype=np.float32) with (w, h).
-    - Action masking: Boolean 1D mask enforcing boundary condition and pairwise non-overlap.
+        - 'grid_occupancy': Box(low=0.0, high=1.0, shape=(1, H, W), dtype=np.float32)
+          reflecting engine.occupancy_grid.
+        - 'macro_features': Box(low=0.0, high=float(max(W, H)), shape=(2,), dtype=np.float32)
+          reflecting current macro (w, h).
+    - Action masking: Boolean 1D mask from engine.compute_action_mask(macro_id, flatten=True).
+    - Objective: Evaluated via evaluate_placement(netlist, placement, alpha, beta),
+      J(P) = alpha * HPWL(P) + beta * C_score(P).
+    - Reward: Step reward based on objective improvement:
+        reward = previous_objective - current_objective.
     """
 
     metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
-        grid_width: int,
-        grid_height: int,
-        netlist: Sequence[Any] | Mapping[Any, Any] | Any,
-        nets: Sequence[Any] | None = None,
+        netlist_or_w: Netlist | Any = None,
+        grid_height: int | None = None,
+        netlist: Any = None,
+        *,
+        grid_width: int | None = None,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        terminal_bonus: float = 0.0,
+        dead_end_penalty: float = 20.0,
+        illegal_action_penalty: float = 50.0,
+        **kwargs: Any,
     ) -> None:
+        if not _HAS_GYMNASIUM:
+            raise ImportError(
+                "Gymnasium is required for MacroPlacementEnv. "
+                "Install gymnasium>=1.4.0."
+            )
         super().__init__()
-        self.grid_width = int(grid_width)
-        self.grid_height = int(grid_height)
 
-        if self.grid_width <= 0 or self.grid_height <= 0:
+        # Resolve netlist from diverse calling signatures (canonical, positional, or kwargs)
+        target_netlist: Any
+        if isinstance(netlist_or_w, (int, np.integer)):
+            gw = int(netlist_or_w)
+            gh = int(grid_height) if grid_height is not None else 10
+            raw_nl = netlist if netlist is not None else kwargs.get("netlist", {})
+            if isinstance(raw_nl, Mapping) and "grid_w" not in raw_nl:
+                target_netlist = dict(raw_nl, grid_w=gw, grid_h=gh)
+            elif isinstance(raw_nl, Sequence) and not isinstance(raw_nl, (str, bytes)):
+                target_netlist = {"grid_w": gw, "grid_h": gh, "macros": raw_nl, "nets": kwargs.get("nets", [])}
+            else:
+                target_netlist = raw_nl
+        else:
+            raw_nl = netlist_or_w if netlist_or_w is not None else netlist
+            if raw_nl is None:
+                raw_nl = kwargs.get("netlist")
+            gw_val = grid_width if grid_width is not None else kwargs.get("grid_w")
+            gh_val = grid_height if grid_height is not None else kwargs.get("grid_h")
+            if gw_val is not None and gh_val is not None:
+                if isinstance(raw_nl, Mapping) and "grid_w" not in raw_nl:
+                    target_netlist = dict(raw_nl, grid_w=int(gw_val), grid_h=int(gh_val))
+                elif isinstance(raw_nl, Sequence) and not isinstance(raw_nl, (str, bytes)):
+                    target_netlist = {
+                        "grid_w": int(gw_val),
+                        "grid_h": int(gh_val),
+                        "macros": raw_nl,
+                        "nets": kwargs.get("nets", []),
+                    }
+                else:
+                    target_netlist = raw_nl
+            else:
+                target_netlist = raw_nl
+
+        self.netlist: Netlist = to_canonical_netlist(target_netlist)
+        self.alpha: float = float(alpha)
+        self.beta: float = float(beta)
+        self.terminal_bonus: float = float(terminal_bonus)
+        self.dead_end_penalty: float = float(dead_end_penalty)
+        self.illegal_action_penalty: float = float(illegal_action_penalty)
+
+        self.grid_w: int = self.netlist.grid_w
+        self.grid_h: int = self.netlist.grid_h
+
+        if self.grid_w <= 0 or self.grid_h <= 0:
             raise ValueError(
-                f"Grid dimensions must be positive integers, got W={grid_width}, H={grid_height}"
+                f"Grid dimensions must be positive integers, got W={self.grid_w}, H={self.grid_h}"
             )
 
-        # 1. Parse and normalize netlist macros
-        self.macros: list[MacroSpec] = self._normalize_netlist_macros(netlist)
-        self.nets: list[dict[str, Any]] = self._normalize_nets(netlist, nets)
+        # Canonical PlacementEngine instance
+        self.engine: PlacementEngine = PlacementEngine(self.netlist)
+        self.macros: list[Macro] = list(self.netlist.macros)
 
-        # 2. Action space: Flattened 1D grid coordinates [0, W * H - 1]
-        self.action_space = spaces.Discrete(self.grid_width * self.grid_height)
+        # Action space: discrete coordinates [0, grid_w * grid_h - 1]
+        self.action_space = spaces.Discrete(self.grid_w * self.grid_h)
 
-        # 3. Observation space: Dict for CNN grid occupancy + MLP macro dimensions
+        # Observation space: 2D occupancy grid + current macro dimensions
         self.observation_space = spaces.Dict(
             {
                 "grid_occupancy": spaces.Box(
                     low=0.0,
                     high=1.0,
-                    shape=(1, self.grid_width, self.grid_height),
+                    shape=(1, self.grid_h, self.grid_w),
                     dtype=np.float32,
                 ),
                 "macro_features": spaces.Box(
                     low=0.0,
-                    high=float(max(self.grid_width, self.grid_height)),
+                    high=float(max(self.grid_w, self.grid_h)),
                     shape=(2,),
                     dtype=np.float32,
                 ),
             }
         )
 
-        # 4. State variables
-        self.grid = np.zeros((self.grid_width, self.grid_height), dtype=np.float32)
-        self.placed_macros: list[dict[str, Any]] = []
-        self.current_macro_idx = 0
+        # State tracking
+        self.current_macro_idx: int = 0
+        self.current_objective: float = 0.0
 
-    @staticmethod
-    def _normalize_netlist_macros(raw_netlist: Any) -> list[MacroSpec]:
-        """Convert arbitrary netlist input formats into a list of MacroSpec."""
-        raw_items: Sequence[Any] = []
+    @property
+    def placed_macros(self) -> Placement:
+        """Return placed macros as canonical Placement list."""
+        return self.engine.get_placement()
 
-        if hasattr(raw_netlist, "macros"):
-            raw_macros = raw_netlist.macros
-            if isinstance(raw_macros, Mapping):
-                raw_items = list(raw_macros.items())
-            elif isinstance(raw_macros, Sequence):
-                raw_items = list(raw_macros)
-        elif isinstance(raw_netlist, Mapping) and "macros" in raw_netlist:
-            raw_macros = raw_netlist["macros"]
-            if isinstance(raw_macros, Mapping):
-                raw_items = list(raw_macros.items())
-            elif isinstance(raw_macros, Sequence):
-                raw_items = list(raw_macros)
-        elif isinstance(raw_netlist, Sequence):
-            raw_items = raw_netlist
-        else:
-            raise TypeError(f"Unsupported netlist format: {type(raw_netlist)}")
+    @property
+    def grid(self) -> np.ndarray:
+        """Return occupancy grid from PlacementEngine."""
+        return self.engine.occupancy_grid
 
-        specs: list[MacroSpec] = []
-        for idx, item in enumerate(raw_items):
-            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], (str, int)):
-                # Tuple of (macro_id, dimensions)
-                mid = item[0]
-                dim = item[1]
-                if isinstance(dim, (tuple, list)):
-                    w, h = dim[0], dim[1]
-                elif isinstance(dim, Mapping):
-                    w = dim.get("w", dim.get("width", 1))
-                    h = dim.get("h", dim.get("height", 1))
-                else:
-                    w = getattr(dim, "w", getattr(dim, "width", 1))
-                    h = getattr(dim, "h", getattr(dim, "height", 1))
-            elif isinstance(item, (tuple, list)) and len(item) == 2:
-                # Raw (w, h) tuple
-                mid = idx
-                w, h = item[0], item[1]
-            elif isinstance(item, Mapping):
-                mid = item.get("id", idx)
-                w = item.get("w", item.get("width", 1))
-                h = item.get("h", item.get("height", 1))
-            else:
-                mid = getattr(item, "id", idx)
-                w = getattr(item, "w", getattr(item, "width", 1))
-                h = getattr(item, "h", getattr(item, "height", 1))
+    @property
+    def grid_width(self) -> int:
+        """Grid width in cells."""
+        return self.grid_w
 
-            specs.append(MacroSpec(id=mid, w=int(w), h=int(h)))
-
-        return specs
-
-    @staticmethod
-    def _normalize_nets(netlist: Any, nets: Sequence[Any] | None) -> list[dict[str, Any]]:
-        """Extract multi-pin nets for HPWL calculation if available."""
-        target_nets = nets
-        if target_nets is None:
-            if hasattr(netlist, "nets"):
-                target_nets = getattr(netlist, "nets")
-            elif isinstance(netlist, Mapping) and "nets" in netlist:
-                target_nets = netlist["nets"]
-
-        if not target_nets:
-            return []
-
-        normalized: list[dict[str, Any]] = []
-        if isinstance(target_nets, Mapping):
-            for nid, net_info in target_nets.items():
-                if isinstance(net_info, Mapping):
-                    pins = net_info.get("pins", net_info.get("macro_ids", []))
-                    weight = float(net_info.get("weight", 1.0))
-                else:
-                    pins = getattr(net_info, "pins", getattr(net_info, "macro_ids", []))
-                    weight = float(getattr(net_info, "weight", 1.0))
-                normalized.append({"id": nid, "pins": list(pins), "weight": weight})
-        elif isinstance(target_nets, Sequence):
-            for idx, item in enumerate(target_nets):
-                if isinstance(item, Mapping):
-                    pins = item.get("pins", item.get("macro_ids", []))
-                    weight = float(item.get("weight", 1.0))
-                    normalized.append({"id": item.get("id", idx), "pins": list(pins), "weight": weight})
-                elif hasattr(item, "macro_ids"):
-                    pins = list(item.macro_ids)
-                    weight = float(getattr(item, "weight", 1.0))
-                    normalized.append({"id": getattr(item, "id", idx), "pins": pins, "weight": weight})
-
-        return normalized
+    @property
+    def grid_height(self) -> int:
+        """Grid height in cells."""
+        return self.grid_h
 
     def _get_obs(self) -> dict[str, np.ndarray]:
-        """Construct the Dict observation for the current placement step."""
-        occupancy = self.grid[np.newaxis, :, :].copy()  # Shape: (1, W, H)
+        """Construct observation dictionary for current placement state."""
+        occupancy = self.engine.occupancy_grid.astype(np.float32)[np.newaxis, :, :]  # (1, H, W)
 
         if self.current_macro_idx < len(self.macros):
-            current_macro = self.macros[self.current_macro_idx]
-            features = np.array([float(current_macro.w), float(current_macro.h)], dtype=np.float32)
+            curr = self.macros[self.current_macro_idx]
+            features = np.array([float(curr.w), float(curr.h)], dtype=np.float32)
         else:
             features = np.zeros(2, dtype=np.float32)
 
@@ -206,38 +213,16 @@ class MacroPlacementEnv(gym.Env):
     def action_masks(self) -> np.ndarray:
         """Compute boolean validity mask for placing the current macro.
 
-        A placement is legal iff:
-        1. Boundary: 0 <= x <= W - w and 0 <= y <= H - h.
-        2. Non-overlap: Grid slice [x:x+w, y:y+h] has no existing placed macros.
+        Delegates directly to PlacementEngine.compute_action_mask.
 
         Returns:
-            Flattened 1D boolean numpy array of size W * H where True is a valid action.
+            Flattened 1D boolean numpy array of size grid_w * grid_h.
         """
-        mask = np.zeros(self.grid_width * self.grid_height, dtype=bool)
-
-        # If all macros are already placed, no actions are valid
         if self.current_macro_idx >= len(self.macros):
-            return mask
+            return np.zeros(self.grid_w * self.grid_h, dtype=bool)
 
         curr = self.macros[self.current_macro_idx]
-        w, h = curr.w, curr.h
-
-        # Strict boundary bounds
-        max_x = self.grid_width - w
-        max_y = self.grid_height - h
-
-        if max_x < 0 or max_y < 0:
-            return mask
-
-        # Check all candidate anchors (x, y)
-        for y in range(max_y + 1):
-            for x in range(max_x + 1):
-                # Check non-overlap constraint
-                if not np.any(self.grid[x : x + w, y : y + h] > 0):
-                    action_idx = y * self.grid_width + x
-                    mask[action_idx] = True
-
-        return mask
+        return self.engine.compute_action_mask(curr.id, flatten=True)
 
     def reset(
         self,
@@ -245,12 +230,25 @@ class MacroPlacementEnv(gym.Env):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-        """Reset environment to blank grid and initial macro index."""
+        """Reset environment and underlying PlacementEngine."""
         super().reset(seed=seed)
-        self.grid.fill(0.0)
-        self.placed_macros.clear()
+        self.engine.reset()
         self.current_macro_idx = 0
-        return self._get_obs(), {}
+
+        init_eval = evaluate_placement(
+            self.netlist, self.engine.get_placement(), alpha=self.alpha, beta=self.beta
+        )
+        self.current_objective = float(init_eval.objective)
+
+        info = {
+            "placed_count": 0,
+            "total_macros": len(self.macros),
+            "hpwl": init_eval.hpwl,
+            "congestion": init_eval.congestion,
+            "objective": init_eval.objective,
+            "is_complete": False,
+        }
+        return self._get_obs(), info
 
     def step(
         self, action: int
@@ -264,110 +262,91 @@ class MacroPlacementEnv(gym.Env):
             (obs, reward, terminated, truncated, info)
         """
         if self.current_macro_idx >= len(self.macros):
-            return self._get_obs(), 0.0, True, False, {"error": "All macros placed"}
+            return (
+                self._get_obs(),
+                0.0,
+                True,
+                False,
+                {
+                    "error": "All macros placed",
+                    "placed_count": len(self.engine.placed_macros),
+                    "total_macros": len(self.macros),
+                    "is_complete": self.engine.is_complete(),
+                },
+            )
 
         curr = self.macros[self.current_macro_idx]
-        w, h = curr.w, curr.h
+        x, y = action_to_coord(int(action), self.grid_w)
 
-        # Convert 1D action to 2D coordinates (x, y)
-        x = int(action % self.grid_width)
-        y = int(action // self.grid_width)
-
-        # Validate placement against boundary and non-overlap constraints
-        fits_boundary = (0 <= x <= self.grid_width - w) and (0 <= y <= self.grid_height - h)
-        overlap = False
-        if fits_boundary:
-            overlap = bool(np.any(self.grid[x : x + w, y : y + h] > 0))
-
-        if not fits_boundary or overlap:
-            # Action mask violation (defensive guard)
+        # Check legality against PlacementEngine
+        if not self.engine.is_legal(curr.id, x, y):
+            obs = self._get_obs()
+            reward = -self.illegal_action_penalty
             terminated = True
             truncated = False
-            reward = -50.0
-            return self._get_obs(), reward, terminated, truncated, {"error": "Constraint violation"}
-
-        # Place macro and update grid occupancy
-        self.grid[x : x + w, y : y + h] = 1.0
-        self.placed_macros.append(
-            {
+            info = {
+                "error": "Illegal action",
                 "macro_id": curr.id,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
+                "action": int(action),
+                "coord": (x, y),
+                "placed_count": len(self.engine.placed_macros),
+                "total_macros": len(self.macros),
+                "is_complete": False,
             }
-        )
+            return obs, reward, terminated, truncated, info
+
+        # Place macro in shared engine
+        self.engine.place(curr.id, x, y)
         self.current_macro_idx += 1
 
-        terminated = self.current_macro_idx >= len(self.macros)
+        # Evaluate objective using canonical objective module
+        placement = self.engine.get_placement()
+        eval_res = evaluate_placement(
+            self.netlist, placement, alpha=self.alpha, beta=self.beta
+        )
+        new_objective = float(eval_res.objective)
+
+        # Objective-aligned reward: improvement in objective yields positive reward
+        reward = float(self.current_objective - new_objective)
+        self.current_objective = new_objective
+
+        is_complete = self.engine.is_complete()
+        terminated = is_complete or (self.current_macro_idx >= len(self.macros))
         truncated = False
-        reward = 0.0
 
         if terminated:
-            # All macros placed successfully: calculate terminal reward inversely proportional to HPWL
-            hpwl = self._compute_hpwl()
-            # Positive reward inversely proportional to HPWL
-            reward = 100.0 / (hpwl + 1.0)
+            reward += self.terminal_bonus
         else:
-            # Check if remaining placement reached an unrecoverable dead end
-            mask = self.action_masks()
-            if not np.any(mask):
-                # No legal actions left for the next macro
+            # Check if next macro has legal moves
+            next_macro = self.macros[self.current_macro_idx]
+            next_mask = self.engine.compute_action_mask(next_macro.id, flatten=True)
+            if not np.any(next_mask):
                 truncated = True
-                reward = -20.0
+                reward -= self.dead_end_penalty
 
         info = {
-            "placed_count": len(self.placed_macros),
+            "placed_count": len(self.engine.placed_macros),
             "total_macros": len(self.macros),
+            "hpwl": eval_res.hpwl,
+            "congestion": eval_res.congestion,
+            "objective": eval_res.objective,
+            "is_complete": is_complete,
+            "placement": placement,
         }
         return self._get_obs(), float(reward), terminated, truncated, info
 
-    def _compute_hpwl(self) -> float:
-        """Compute Half-Perimeter Wirelength (HPWL) of current placement."""
-        if len(self.placed_macros) <= 1:
-            return 0.0
 
-        # Build center coordinate lookup for placed macros
-        centers: dict[Any, tuple[float, float]] = {
-            pm["macro_id"]: (pm["x"] + pm["w"] / 2.0, pm["y"] + pm["h"] / 2.0)
-            for pm in self.placed_macros
-        }
-
-        total_hpwl = 0.0
-
-        if self.nets:
-            for net in self.nets:
-                pins = [p for p in net.get("pins", []) if p in centers]
-                if len(pins) < 2:
-                    continue
-                xs = [centers[p][0] for p in pins]
-                ys = [centers[p][1] for p in pins]
-                weight = float(net.get("weight", 1.0))
-                hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
-                total_hpwl += weight * hpwl
-        else:
-            # Bounding box & sequential chain surrogate if no explicit nets exist
-            for i in range(len(self.placed_macros) - 1):
-                m1 = self.placed_macros[i]["macro_id"]
-                m2 = self.placed_macros[i + 1]["macro_id"]
-                c1 = centers[m1]
-                c2 = centers[m2]
-                total_hpwl += abs(c1[0] - c2[0]) + abs(c1[1] - c2[1])
-
-        return float(total_hpwl)
-
-
-def mask_fn(env: gym.Env) -> np.ndarray:
+def mask_fn(env: Any) -> np.ndarray:
     """Top-level helper function returning action mask for ActionMasker."""
     return env.action_masks()  # type: ignore[attr-defined]
 
 
 def train_rl_agent(
-    env: gym.Env,
+    env: Any,
     total_timesteps: int = 10000,
     save_path: str = "ppo_macro_placement.zip",
     verbose: int = 1,
-) -> MaskablePPO:
+) -> Any:
     """Wrap environment with ActionMasker, train MaskablePPO, and save checkpoint.
 
     Args:
@@ -379,6 +358,12 @@ def train_rl_agent(
     Returns:
         Trained MaskablePPO agent.
     """
+    if not _HAS_SB3:
+        raise ImportError(
+            "sb3-contrib is required to train MaskablePPO. "
+            "Install sb3-contrib>=2.9.2."
+        )
+
     wrapped_env = ActionMasker(env, mask_fn)
 
     model = MaskablePPO(
@@ -393,13 +378,502 @@ def train_rl_agent(
 
     model.learn(total_timesteps=total_timesteps)
 
-    # Ensure parent directory exists and save model
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
     model.save(save_path)
 
     return model
+
+
+@dataclass
+class PPOTrainingConfig:
+    """Hyperparameters and configuration for PPO training and evaluation."""
+
+    total_timesteps: int = 256
+    learning_rate: float = 3e-4
+    n_steps: int = 64
+    batch_size: int = 32
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    ent_coef: float = 0.01
+    seed: int = 42
+    alpha: float = 1.0
+    beta: float = 1.0
+    terminal_bonus: float = 0.0
+    dead_end_penalty: float = 20.0
+    illegal_action_penalty: float = 50.0
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_name: str = "ppo_macro_placement.zip"
+    verbose: int = 0
+
+    def validate(self) -> None:
+        """Validate configuration settings and hyperparameter ranges."""
+        if (
+            isinstance(self.total_timesteps, bool)
+            or not isinstance(self.total_timesteps, (int, np.integer))
+            or self.total_timesteps <= 0
+        ):
+            raise ValueError(f"total_timesteps must be a positive integer, got {self.total_timesteps!r}.")
+
+        if (
+            isinstance(self.learning_rate, bool)
+            or not isinstance(self.learning_rate, (int, float, np.floating))
+            or self.learning_rate <= 0
+        ):
+            raise ValueError(f"learning_rate must be a positive number, got {self.learning_rate!r}.")
+
+        if (
+            isinstance(self.n_steps, bool)
+            or not isinstance(self.n_steps, (int, np.integer))
+            or self.n_steps <= 0
+        ):
+            raise ValueError(f"n_steps must be a positive integer, got {self.n_steps!r}.")
+
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, (int, np.integer))
+            or self.batch_size <= 0
+        ):
+            raise ValueError(f"batch_size must be a positive integer, got {self.batch_size!r}.")
+
+        if self.batch_size > self.n_steps:
+            raise ValueError(
+                f"batch_size ({self.batch_size}) cannot exceed n_steps ({self.n_steps})."
+            )
+
+        if (
+            isinstance(self.gamma, bool)
+            or not isinstance(self.gamma, (int, float, np.floating))
+            or not (0.0 <= self.gamma <= 1.0)
+        ):
+            raise ValueError(f"gamma must be between 0.0 and 1.0, got {self.gamma!r}.")
+
+        if (
+            isinstance(self.gae_lambda, bool)
+            or not isinstance(self.gae_lambda, (int, float, np.floating))
+            or not (0.0 <= self.gae_lambda <= 1.0)
+        ):
+            raise ValueError(f"gae_lambda must be between 0.0 and 1.0, got {self.gae_lambda!r}.")
+
+        if (
+            isinstance(self.clip_range, bool)
+            or not isinstance(self.clip_range, (int, float, np.floating))
+            or self.clip_range <= 0.0
+        ):
+            raise ValueError(f"clip_range must be positive, got {self.clip_range!r}.")
+
+        if (
+            isinstance(self.ent_coef, bool)
+            or not isinstance(self.ent_coef, (int, float, np.floating))
+            or self.ent_coef < 0.0
+        ):
+            raise ValueError(f"ent_coef must be non-negative, got {self.ent_coef!r}.")
+
+        if (
+            isinstance(self.alpha, bool)
+            or not isinstance(self.alpha, (int, float, np.floating))
+            or self.alpha < 0.0
+            or isinstance(self.beta, bool)
+            or not isinstance(self.beta, (int, float, np.floating))
+            or self.beta < 0.0
+        ):
+            raise ValueError(
+                f"alpha and beta must be non-negative numbers, got alpha={self.alpha!r}, beta={self.beta!r}."
+            )
+
+        if not self.checkpoint_dir or not isinstance(self.checkpoint_dir, str):
+            raise ValueError(f"checkpoint_dir must be a non-empty string, got {self.checkpoint_dir!r}.")
+
+        if not self.checkpoint_name or not isinstance(self.checkpoint_name, str):
+            raise ValueError(f"checkpoint_name must be a non-empty string, got {self.checkpoint_name!r}.")
+
+
+@dataclass(frozen=True)
+class PPOEvalResult:
+    """Evaluation metrics for a trained PPO model or RL inference run."""
+
+    algorithm: str
+    feasible: bool
+    objective: float | None
+    hpwl: float | None
+    congestion: float | None
+    runtime_sec: float
+    placement: Placement
+    steps: int
+    total_macros: int
+    seed: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert evaluation result to JSON-serializable dictionary."""
+        return {
+            "algorithm": self.algorithm,
+            "feasible": self.feasible,
+            "objective": self.objective,
+            "hpwl": self.hpwl,
+            "congestion": self.congestion,
+            "runtime_sec": self.runtime_sec,
+            "steps": self.steps,
+            "total_macros": self.total_macros,
+            "seed": self.seed,
+            "placement": [
+                {"macro_id": pm.macro_id, "x": pm.x, "y": pm.y}
+                for pm in self.placement
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class PPOTrainingResult:
+    """Summary of a completed PPO training run."""
+
+    algorithm: str
+    netlist_id: str
+    seed: int
+    total_timesteps: int
+    training_time_s: float
+    checkpoint_path: str
+    eval_result: PPOEvalResult
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert training result to JSON-serializable dictionary."""
+        return {
+            "algorithm": self.algorithm,
+            "netlist_id": self.netlist_id,
+            "seed": self.seed,
+            "total_timesteps": self.total_timesteps,
+            "training_time_s": self.training_time_s,
+            "checkpoint_path": self.checkpoint_path,
+            "eval_result": self.eval_result.to_dict(),
+        }
+
+
+def train_ppo(
+    netlist: Any,
+    config: PPOTrainingConfig | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> PPOTrainingResult:
+    """Train MaskablePPO agent on the placement environment and save checkpoint.
+
+    Parameters:
+        netlist: Circuit netlist (Netlist object, dict, or sequence).
+        config: Training configuration with hyperparameters and settings.
+        checkpoint_path: Optional explicit output path for model checkpoint.
+
+    Returns:
+        PPOTrainingResult containing training duration, checkpoint path, and evaluation result.
+    """
+    if not _HAS_GYMNASIUM:
+        raise ImportError(
+            "Gymnasium is required for PPO training. "
+            "Please install gymnasium>=1.4.0."
+        )
+    if not _HAS_SB3:
+        raise ImportError(
+            "sb3-contrib is required for MaskablePPO training. "
+            "Please install sb3-contrib>=2.9.2."
+        )
+
+    cfg = config if config is not None else PPOTrainingConfig()
+    cfg.validate()
+
+    # Deterministic RNG seeding across python, numpy, torch
+    seed = int(cfg.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+    canonical_nl = to_canonical_netlist(netlist)
+    train_env = MacroPlacementEnv(
+        netlist=canonical_nl,
+        alpha=cfg.alpha,
+        beta=cfg.beta,
+        terminal_bonus=cfg.terminal_bonus,
+        dead_end_penalty=cfg.dead_end_penalty,
+        illegal_action_penalty=cfg.illegal_action_penalty,
+    )
+    wrapped_env = ActionMasker(train_env, mask_fn)
+
+    model = MaskablePPO(
+        policy="MultiInputPolicy",
+        env=wrapped_env,
+        learning_rate=cfg.learning_rate,
+        n_steps=cfg.n_steps,
+        batch_size=cfg.batch_size,
+        gamma=cfg.gamma,
+        gae_lambda=cfg.gae_lambda,
+        clip_range=cfg.clip_range,
+        ent_coef=cfg.ent_coef,
+        seed=seed,
+        verbose=cfg.verbose,
+    )
+
+    t0 = time.perf_counter()
+    model.learn(total_timesteps=cfg.total_timesteps)
+    train_time = time.perf_counter() - t0
+
+    # Resolve checkpoint destination
+    if checkpoint_path is not None:
+        save_p = Path(checkpoint_path)
+    else:
+        save_p = Path(cfg.checkpoint_dir) / cfg.checkpoint_name
+
+    save_p.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(save_p))
+
+    # Evaluate trained model
+    eval_res = evaluate_ppo(
+        canonical_nl,
+        model_or_path=model,
+        seed=seed,
+        alpha=cfg.alpha,
+        beta=cfg.beta,
+    )
+
+    netlist_id = getattr(canonical_nl, "version", "custom")
+    return PPOTrainingResult(
+        algorithm="rl",
+        netlist_id=netlist_id,
+        seed=seed,
+        total_timesteps=cfg.total_timesteps,
+        training_time_s=train_time,
+        checkpoint_path=str(save_p),
+        eval_result=eval_res,
+    )
+
+
+def evaluate_ppo(
+    netlist: Any,
+    model_or_path: Any | str | Path | None = None,
+    seed: int = 42,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    deterministic: bool = True,
+) -> PPOEvalResult:
+    """Deterministically evaluate an RL policy or loaded MaskablePPO model on a netlist.
+
+    Parameters:
+        netlist: Circuit netlist.
+        model_or_path: MaskablePPO model instance, checkpoint file path, or None for masked policy fallback.
+        seed: Random seed for environment reset.
+        alpha: HPWL weight.
+        beta: Congestion weight.
+        deterministic: Whether to use deterministic action selection.
+
+    Returns:
+        PPOEvalResult containing placement, feasibility, HPWL, congestion, and objective.
+    """
+    if not _HAS_GYMNASIUM:
+        raise ImportError(
+            "Gymnasium is required for PPO evaluation. "
+            "Please install gymnasium>=1.4.0."
+        )
+
+    canonical_nl = to_canonical_netlist(netlist)
+
+    model = None
+    if model_or_path is not None:
+        if isinstance(model_or_path, (str, Path)):
+            if not _HAS_SB3:
+                raise ImportError("sb3-contrib is required to load a MaskablePPO checkpoint.")
+            m_str = str(model_or_path)
+            if not (os.path.exists(m_str) or os.path.exists(f"{m_str}.zip")):
+                raise FileNotFoundError(f"Checkpoint not found at '{m_str}'.")
+            model = MaskablePPO.load(m_str)
+        else:
+            model = model_or_path
+
+    env = MacroPlacementEnv(netlist=canonical_nl, alpha=alpha, beta=beta)
+    obs, _info = env.reset(seed=seed)
+    total_macros = len(env.macros)
+    step = 0
+    done = False
+    start_t = time.perf_counter()
+
+    while not done:
+        masks = env.action_masks()
+        if not np.any(masks):
+            break
+
+        if model is not None:
+            action, _states = model.predict(obs, action_masks=masks, deterministic=deterministic)
+            action_int = int(action)
+        else:
+            # Deterministic fallback: choose first legal position
+            action_int = int(np.where(masks)[0][0])
+
+        obs, _reward, terminated, truncated, _step_info = env.step(action_int)
+        step += 1
+        done = terminated or truncated
+
+    runtime = time.perf_counter() - start_t
+    placement = env.engine.get_placement()
+    is_complete = env.engine.is_complete()
+    val_report = validate_placement(canonical_nl, placement)
+    feasible = is_complete and val_report.is_valid
+
+    if feasible:
+        eval_metrics = evaluate_placement(canonical_nl, placement, alpha=alpha, beta=beta)
+        hpwl = eval_metrics.hpwl
+        congestion = eval_metrics.congestion
+        objective = eval_metrics.objective
+    else:
+        hpwl = None
+        congestion = None
+        objective = None
+
+    return PPOEvalResult(
+        algorithm="rl",
+        feasible=feasible,
+        objective=objective,
+        hpwl=hpwl,
+        congestion=congestion,
+        runtime_sec=runtime,
+        placement=placement,
+        steps=step,
+        total_macros=total_macros,
+        seed=seed,
+    )
+
+
+def compare_baseline(
+    netlist: Any,
+    seed: int = 42,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    rl_model_or_path: Any | None = None,
+    sa_iterations: int = 100,
+) -> dict[str, dict[str, Any]]:
+    """Compare Random, Greedy, Simulated Annealing, and RL on a common netlist.
+
+    Parameters:
+        netlist: Canonical or dict/raw circuit netlist.
+        seed: Random seed for reproducible comparison.
+        alpha: Weight for HPWL in combined objective J(P) = alpha * HPWL + beta * C_score.
+        beta: Weight for Congestion score in combined objective.
+        rl_model_or_path: Optional trained MaskablePPO model or file path.
+        sa_iterations: Maximum iterations for Simulated Annealing.
+
+    Returns:
+        Dictionary mapping algorithm name to its performance record:
+        {
+            'random': {'feasible': bool, 'hpwl': float, 'congestion': float, 'objective': float, 'runtime_sec': float},
+            'greedy': {'feasible': bool, 'hpwl': float, 'congestion': float, 'objective': float, 'runtime_sec': float},
+            'sa':     {'feasible': bool, 'hpwl': float, 'congestion': float, 'objective': float, 'runtime_sec': float},
+            'rl':     {'feasible': bool, 'hpwl': float, 'congestion': float, 'objective': float, 'runtime_sec': float, 'error': str | None},
+        }
+    """
+    canonical_nl = to_canonical_netlist(netlist)
+    results: dict[str, dict[str, Any]] = {}
+
+    # 1. Random Placement
+    from src.algorithms.common import random_legal_placement
+
+    t0 = time.perf_counter()
+    rand_placement = random_legal_placement(canonical_nl, seed=seed)
+    rand_time = time.perf_counter() - t0
+    if rand_placement is not None:
+        rand_eval = evaluate_placement(canonical_nl, rand_placement, alpha=alpha, beta=beta)
+        results["random"] = {
+            "feasible": True,
+            "hpwl": rand_eval.hpwl,
+            "congestion": rand_eval.congestion,
+            "objective": rand_eval.objective,
+            "runtime_sec": rand_time,
+            "error": None,
+        }
+    else:
+        results["random"] = {
+            "feasible": False,
+            "hpwl": None,
+            "congestion": None,
+            "objective": None,
+            "runtime_sec": rand_time,
+            "error": "Dead end reached during random placement",
+        }
+
+    # 2. Greedy Placement
+    from src.algorithms.greedy import greedy_placement
+
+    t0 = time.perf_counter()
+    g_res = greedy_placement(canonical_nl, alpha=alpha, beta=beta)
+    g_time = time.perf_counter() - t0
+    results["greedy"] = {
+        "feasible": g_res.success,
+        "hpwl": g_res.hpwl if g_res.success else None,
+        "congestion": g_res.congestion if g_res.success else None,
+        "objective": g_res.objective if g_res.success else None,
+        "runtime_sec": g_time,
+        "error": None if g_res.success else "Greedy failed to place all macros",
+    }
+
+    # 3. Simulated Annealing
+    from src.algorithms.simulated_annealing import simulated_annealing
+
+    t0 = time.perf_counter()
+    sa_res = simulated_annealing(
+        canonical_nl,
+        alpha=alpha,
+        beta=beta,
+        seed=seed,
+        max_iterations=sa_iterations,
+    )
+    sa_time = time.perf_counter() - t0
+    results["sa"] = {
+        "feasible": sa_res.success,
+        "hpwl": sa_res.hpwl if sa_res.success else None,
+        "congestion": sa_res.congestion if sa_res.success else None,
+        "objective": sa_res.objective if sa_res.success else None,
+        "runtime_sec": sa_time,
+        "error": None if sa_res.success else "SA failed to find legal placement",
+    }
+
+    # 4. Reinforcement Learning
+    if not _HAS_GYMNASIUM:
+        results["rl"] = {
+            "feasible": False,
+            "hpwl": None,
+            "congestion": None,
+            "objective": None,
+            "runtime_sec": 0.0,
+            "error": "Gymnasium is required for RL evaluation. Install gymnasium>=1.4.0.",
+        }
+    else:
+        try:
+            rl_eval = evaluate_ppo(
+                canonical_nl,
+                model_or_path=rl_model_or_path,
+                seed=seed,
+                alpha=alpha,
+                beta=beta,
+            )
+            results["rl"] = {
+                "feasible": rl_eval.feasible,
+                "hpwl": rl_eval.hpwl,
+                "congestion": rl_eval.congestion,
+                "objective": rl_eval.objective,
+                "runtime_sec": rl_eval.runtime_sec,
+                "error": None if rl_eval.feasible else "RL policy reached dead end",
+            }
+        except Exception as exc:  # noqa: BLE001
+            results["rl"] = {
+                "feasible": False,
+                "hpwl": None,
+                "congestion": None,
+                "objective": None,
+                "runtime_sec": 0.0,
+                "error": str(exc),
+            }
+
+    return results
 
 
 def solve(
@@ -430,28 +904,24 @@ def solve(
         - cost: Combined objective score
         - hpwl: Total Half-Perimeter Wirelength
         - congestion: Congestion score
+        - objective: Combined objective value
         - evals: Total inference evaluations executed
         - trace: List of progress snapshots
     """
     start_time = time.perf_counter()
     cfg = env_config or {}
 
-    # 1. Resolve grid dimensions from config or netlist
-    grid_w = int(cfg.get("grid_width", getattr(netlist, "grid_w", 16)))
-    grid_h = int(cfg.get("grid_height", getattr(netlist, "grid_h", 16)))
+    alpha = float(cfg.get("alpha", 1.0))
+    beta = float(cfg.get("beta", 1.0))
     model_path = str(cfg.get("model_path", "ppo_macro_placement.zip"))
 
-    # 2. Instantiate environment
-    env = MacroPlacementEnv(grid_width=grid_w, grid_height=grid_h, netlist=netlist)
+    env = MacroPlacementEnv(netlist=netlist, alpha=alpha, beta=beta)
 
-    # 3. Load or train model
-    if os.path.exists(model_path) or os.path.exists(model_path + ".zip"):
-        model = MaskablePPO.load(model_path)
-    else:
-        # Fallback train quick model if checkpoint doesn't exist yet
-        model = train_rl_agent(env, total_timesteps=1000, save_path=model_path, verbose=0)
+    model = None
+    if _HAS_SB3:
+        if os.path.exists(model_path) or os.path.exists(model_path + ".zip"):
+            model = MaskablePPO.load(model_path)
 
-    # 4. Run deterministic inference loop with action masks
     obs, _info = env.reset(seed=seed)
     done = False
     evals = 0
@@ -460,26 +930,38 @@ def solve(
     while not done:
         masks = env.action_masks()
         if not np.any(masks):
-            # No valid placement anchor available (dead end)
             break
 
-        action, _states = model.predict(obs, action_masks=masks, deterministic=True)
-        obs, reward, terminated, truncated, _step_info = env.step(int(action))
+        if model is not None:
+            action, _states = model.predict(obs, action_masks=masks, deterministic=True)
+            action_int = int(action)
+        else:
+            # Deterministic fallback to first legal action
+            action_int = int(np.where(masks)[0][0])
+
+        obs, reward, terminated, truncated, step_info = env.step(action_int)
         evals += 1
         done = terminated or truncated
 
         elapsed = time.perf_counter() - start_time
-        hpwl_snapshot = env._compute_hpwl()
-        trace.append({"eval": evals, "t_s": elapsed, "best_cost": hpwl_snapshot})
+        hpwl_snapshot = step_info.get("hpwl", 0.0)
+        obj_snapshot = step_info.get("objective", 0.0)
+        trace.append({
+            "eval": evals,
+            "t_s": elapsed,
+            "best_cost": obj_snapshot,
+            "hpwl": hpwl_snapshot,
+        })
 
         if on_progress is not None:
             progress_payload = {
                 "step": evals,
                 "total_steps": len(env.macros),
                 "hpwl": hpwl_snapshot,
+                "objective": obj_snapshot,
                 "placement": [
-                    {"macro_id": pm["macro_id"], "x": pm["x"], "y": pm["y"]}
-                    for pm in env.placed_macros
+                    {"macro_id": pm.macro_id, "x": pm.x, "y": pm.y}
+                    for pm in env.engine.get_placement()
                 ],
             }
             if inspect.iscoroutinefunction(on_progress):
@@ -494,66 +976,22 @@ def solve(
             else:
                 on_progress(progress_payload)
 
-    # 5. Compile placement results
     placement = [
-        {"macro_id": pm["macro_id"], "x": pm["x"], "y": pm["y"]}
-        for pm in env.placed_macros
+        {"macro_id": pm.macro_id, "x": pm.x, "y": pm.y}
+        for pm in env.engine.get_placement()
     ]
-    feasible = len(env.placed_macros) == len(env.macros)
+    feasible = env.engine.is_complete()
     runtime_s = time.perf_counter() - start_time
-    hpwl = env._compute_hpwl() if feasible else None
-    cost = hpwl if hpwl is not None else float("inf")
+    eval_res = evaluate_placement(env.netlist, env.engine.get_placement(), alpha=alpha, beta=beta)
 
     return {
         "placement": placement,
         "feasible": feasible,
         "runtime_s": runtime_s,
-        "cost": cost,
-        "hpwl": hpwl,
-        "congestion": 0.0,
+        "cost": eval_res.objective if feasible else float("inf"),
+        "hpwl": eval_res.hpwl if feasible else None,
+        "congestion": eval_res.congestion if feasible else None,
+        "objective": eval_res.objective if feasible else None,
         "evals": evals,
         "trace": trace,
     }
-
-
-if __name__ == "__main__":
-    print("=== Testing RL Macro Placement Pipeline ===")
-
-    # 1. Define dummy netlist
-    dummy_netlist = [
-        {"id": "macro_0", "w": 4, "h": 4},
-        {"id": "macro_1", "w": 3, "h": 5},
-        {"id": "macro_2", "w": 2, "h": 3},
-        {"id": "macro_3", "w": 3, "h": 3},
-    ]
-
-    # 2. Instantiate Gymnasium environment
-    test_env = MacroPlacementEnv(grid_width=10, grid_height=10, netlist=dummy_netlist)
-    obs, info = test_env.reset()
-    print("Environment reset successful. Obs shapes:")
-    print(" - grid_occupancy:", obs["grid_occupancy"].shape)
-    print(" - macro_features:", obs["macro_features"].shape)
-    print(" - initial valid actions:", int(np.sum(test_env.action_masks())))
-
-    # 3. Train MaskablePPO agent
-    ckpt_file = "ppo_macro_placement.zip"
-    print(f"\nTraining MaskablePPO agent ({ckpt_file})...")
-    agent = train_rl_agent(test_env, total_timesteps=500, save_path=ckpt_file, verbose=0)
-    print("Training complete and checkpoint saved.")
-
-    # 4. Run deterministic solver inference
-    print("\nRunning inference via standardized solve() interface...")
-    res = solve(
-        netlist=dummy_netlist,
-        env_config={"grid_width": 10, "grid_height": 10, "model_path": ckpt_file},
-        budget=100,
-        seed=42,
-    )
-
-    print("\nSolver Result:")
-    print(" - Feasible:", res["feasible"])
-    print(" - Placed Macros:", len(res["placement"]))
-    print(" - Placement coordinates:", res["placement"])
-    print(" - HPWL:", res["hpwl"])
-    print(f" - Inference Runtime: {res['runtime_s']:.4f} s")
-    print("Success: Complete RL pipeline functional and verified!")

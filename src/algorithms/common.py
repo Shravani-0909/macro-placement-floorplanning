@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 
-from src.placement.engine import PlacementEngine
 from src.placement.models import Macro, Net, Netlist, PlacedMacro, Placement
 
 
@@ -220,6 +219,8 @@ def random_legal_placement(netlist: Any, seed: int | None = 42) -> Placement | N
     Returns:
         A list of PlacedMacro objects (Placement) if successful, or None if dead end reached.
     """
+    from src.placement.engine import PlacementEngine
+
     canonical_nl = to_canonical_netlist(netlist)
     engine = PlacementEngine(canonical_nl)
     rng = random.Random(seed) if seed is not None else random.Random()

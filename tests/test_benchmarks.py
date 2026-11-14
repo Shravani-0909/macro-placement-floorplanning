@@ -10,9 +10,13 @@ import pytest
 
 from src.placement.benchmarks import (
     BenchmarkRunResult,
+    BenchmarkSummary,
     compute_benchmark_summaries,
     execute_single_benchmark_run,
+    generate_benchmark_netlist,
+    get_connectivity_benchmark_suite,
     get_default_benchmark_suite,
+    get_scaling_benchmark_suite,
     run_benchmark_suite,
 )
 from src.placement.models import Macro, Net, Netlist
@@ -254,3 +258,92 @@ async def test_run_benchmark_suite_all_classical(tmp_path: Path) -> None:
     assert all(s.success_rate == 1.0 for s in summaries)
     algo_names = {s.algorithm for s in summaries}
     assert algo_names == {"random", "greedy", "sa"}
+
+
+def test_scaling_benchmark_suite_validity() -> None:
+    """Scaling suite must contain dense_10, scaling_20, and scaling_30 with valid geometry."""
+    scaling_suite = get_scaling_benchmark_suite()
+    assert "dense_10" in scaling_suite
+    assert "scaling_20" in scaling_suite
+    assert "scaling_30" in scaling_suite
+
+    s20 = scaling_suite["scaling_20"]
+    assert len(s20.macros) == 20
+    assert s20.grid_w == 36
+    assert s20.grid_h == 36
+    assert len(s20.nets) == 18
+
+    s30 = scaling_suite["scaling_30"]
+    assert len(s30.macros) == 30
+    assert s30.grid_w == 48
+    assert s30.grid_h == 48
+    assert len(s30.nets) == 28
+
+
+def test_generate_benchmark_netlist_determinism() -> None:
+    """generate_benchmark_netlist is deterministic given identical seeds."""
+    nl1 = generate_benchmark_netlist(num_macros=10, grid_w=20, grid_h=20, seed=123)
+    nl2 = generate_benchmark_netlist(num_macros=10, grid_w=20, grid_h=20, seed=123)
+    nl3 = generate_benchmark_netlist(num_macros=10, grid_w=20, grid_h=20, seed=456)
+
+    assert [(m.w, m.h) for m in nl1.macros] == [(m.w, m.h) for m in nl2.macros]
+    assert [net.macro_ids for net in nl1.nets] == [net.macro_ids for net in nl2.nets]
+    assert [(m.w, m.h) for m in nl1.macros] != [(m.w, m.h) for m in nl3.macros]
+
+
+def test_connectivity_benchmark_suite_paired_geometry() -> None:
+    """Experiment B paired benchmark suite maintains identical macro dimensions across topologies."""
+    pair = get_connectivity_benchmark_suite(num_macros=12, seed=42)
+    assert "exp_b_12_random" in pair
+    assert "exp_b_12_clustered" in pair
+
+    nl_rand = pair["exp_b_12_random"]
+    nl_clust = pair["exp_b_12_clustered"]
+
+    assert len(nl_rand.macros) == 12
+    assert len(nl_clust.macros) == 12
+    assert nl_rand.grid_w == nl_clust.grid_w
+    assert nl_rand.grid_h == nl_clust.grid_h
+
+    # Crucial property for Experiment B: identical macro dimensions
+    rand_dims = [(m.id, m.w, m.h) for m in nl_rand.macros]
+    clust_dims = [(m.id, m.w, m.h) for m in nl_clust.macros]
+    assert rand_dims == clust_dims
+
+
+@async_test
+async def test_benchmark_metrics_congestion_and_objective() -> None:
+    """Single benchmark execution records HPWL, congestion, objective, and timing metrics."""
+    suite = get_default_benchmark_suite()
+    netlist = suite["toy_4"]
+
+    cfg = {
+        "alpha": 1.0,
+        "beta": 0.5,
+        "train_time_sec": 12.34,
+        "train_timesteps": 5000,
+        "checkpoint_path": "models/test.zip",
+    }
+    result = await execute_single_benchmark_run(
+        algorithm="greedy",
+        netlist_id="toy_4",
+        netlist=netlist,
+        seed=42,
+        config=cfg,
+    )
+
+    assert result.success is True
+    assert result.congestion is not None
+    assert result.congestion >= 0.0
+    assert result.objective is not None
+    assert result.objective == pytest.approx(result.hpwl + 0.5 * result.congestion)
+    assert result.train_time_sec == pytest.approx(12.34)
+    assert result.train_timesteps == 5000
+    assert result.checkpoint_path == "models/test.zip"
+
+    # Verify summary computation includes mean_congestion and mean_objective
+    summaries = compute_benchmark_summaries([result])
+    assert len(summaries) == 1
+    s = summaries[0]
+    assert s.mean_congestion == pytest.approx(result.congestion)
+    assert s.mean_objective == pytest.approx(result.objective)

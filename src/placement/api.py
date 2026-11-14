@@ -4,12 +4,15 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .jobs import ALGORITHM_REGISTRY, JobManager
-from .models import Macro, Net, Netlist
+from .benchmarks import get_default_benchmark_suite
+from .jobs import ALGORITHM_REGISTRY, JobManager, get_registered_algorithms
+from .models import Macro, Net, Netlist, PlacedMacro
+from .objective import congestion_score, rudy_map
 
 
 class MacroSchema(BaseModel):
@@ -88,8 +91,30 @@ class JobStatusResponse(BaseModel):
     step: int
     total_steps: int
     current_hpwl: float | None
+    current_congestion: float | None = None
+    current_objective: float | None = None
+    hpwl: float | None = None
+    congestion: float | None = None
+    objective: float | None = None
     placement: list[PlacedMacroSchema]
     error: str | None = None
+
+
+class RudyRequest(BaseModel):
+    """Payload to compute RUDY congestion map for a placement."""
+
+    netlist: NetlistSchema
+    placement: list[PlacedMacroSchema]
+
+
+class RudyMapResponse(BaseModel):
+    """RUDY routing demand density grid and congestion metrics."""
+
+    grid_w: int
+    grid_h: int
+    demand: list[list[float]]
+    congestion_score: float
+    max_demand: float
 
 
 # Application-level job manager instance
@@ -267,3 +292,110 @@ async def placement_progress_websocket(websocket: WebSocket, run_id: str) -> Non
             await websocket.close()
         except RuntimeError:
             pass
+
+
+@app.get("/api/algorithms", tags=["Algorithms"])
+async def list_algorithms_endpoint() -> dict[str, list[str]]:
+    """List all registered placement algorithms."""
+    return {"algorithms": get_registered_algorithms()}
+
+
+@app.get("/api/benchmarks", tags=["Benchmarks"])
+async def list_benchmarks_endpoint() -> dict[str, Any]:
+    """List standard reproducible benchmark suites."""
+    suite = get_default_benchmark_suite()
+    summaries = []
+    for name, nl in suite.items():
+        area = sum(m.w * m.h for m in nl.macros)
+        g_area = nl.grid_w * nl.grid_h
+        summaries.append({
+            "name": name,
+            "grid_w": nl.grid_w,
+            "grid_h": nl.grid_h,
+            "macro_count": len(nl.macros),
+            "net_count": len(nl.nets),
+            "total_macro_area": area,
+            "grid_area": g_area,
+            "area_utilization": round(area / g_area, 4) if g_area > 0 else 0.0,
+        })
+    return {"benchmarks": summaries}
+
+
+@app.get("/api/benchmarks/{name}", response_model=NetlistSchema, tags=["Benchmarks"])
+async def get_benchmark_endpoint(name: str) -> NetlistSchema:
+    """Retrieve full Netlist specification for a named standard benchmark."""
+    suite = get_default_benchmark_suite()
+    if name not in suite:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Benchmark '{name}' not found. Available: {list(suite.keys())}",
+        )
+    nl = suite[name]
+    return NetlistSchema(
+        version=nl.version,
+        grid_w=nl.grid_w,
+        grid_h=nl.grid_h,
+        macros=[MacroSchema(id=m.id, w=m.w, h=m.h) for m in nl.macros],
+        nets=[
+            NetSchema(id=n.id, macro_ids=list(n.macro_ids), weight=n.weight)
+            for n in nl.nets
+        ],
+    )
+
+
+@app.get(
+    "/api/placements/{run_id}/rudy",
+    response_model=RudyMapResponse,
+    tags=["Placements"],
+)
+async def get_placement_rudy_endpoint(run_id: str) -> RudyMapResponse:
+    """Compute and retrieve the 2D RUDY wire density map for a placement run."""
+    job = job_manager.get_job(run_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Placement run '{run_id}' not found.",
+        )
+    if not job.placement:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Placement run '{run_id}' has no placed macros.",
+        )
+    netlist = job_manager.get_netlist(run_id)
+    if netlist is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Netlist for run '{run_id}' not found.",
+        )
+    demand = rudy_map(netlist, job.placement)
+    c_score = congestion_score(netlist, job.placement)
+    return RudyMapResponse(
+        grid_w=netlist.grid_w,
+        grid_h=netlist.grid_h,
+        demand=demand.tolist(),
+        congestion_score=c_score,
+        max_demand=float(np.max(demand)) if demand.size > 0 else 0.0,
+    )
+
+
+@app.post(
+    "/api/netlist/rudy",
+    response_model=RudyMapResponse,
+    tags=["Netlist"],
+)
+async def compute_rudy_endpoint(req: RudyRequest) -> RudyMapResponse:
+    """Compute 2D RUDY wire density map for arbitrary netlist and placement."""
+    netlist = req.netlist.to_domain_model()
+    placements = [
+        PlacedMacro(macro_id=p.macro_id, x=p.x, y=p.y)
+        for p in req.placement
+    ]
+    demand = rudy_map(netlist, placements)
+    c_score = congestion_score(netlist, placements)
+    return RudyMapResponse(
+        grid_w=netlist.grid_w,
+        grid_h=netlist.grid_h,
+        demand=demand.tolist(),
+        congestion_score=c_score,
+        max_demand=float(np.max(demand)) if demand.size > 0 else 0.0,
+    )

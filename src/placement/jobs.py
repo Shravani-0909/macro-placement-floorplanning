@@ -5,8 +5,6 @@ import random
 import uuid
 import numpy as np
 from collections.abc import Awaitable, Callable, Mapping
-from src.algorithms.greedy import greedy_placement
-from src.algorithms.simulated_annealing import simulated_annealing
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +24,8 @@ class JobProgress:
     step: int
     total_steps: int
     current_hpwl: float | None
+    current_congestion: float | None = None
+    current_objective: float | None = None
     placement: list[PlacedMacro] = field(default_factory=list)
     error: str | None = None
 
@@ -38,6 +38,11 @@ class JobProgress:
             "step": self.step,
             "total_steps": self.total_steps,
             "current_hpwl": self.current_hpwl,
+            "current_congestion": self.current_congestion,
+            "current_objective": self.current_objective,
+            "hpwl": self.current_hpwl,
+            "congestion": self.current_congestion,
+            "objective": self.current_objective,
             "placement": [
                 {"macro_id": pm.macro_id, "x": pm.x, "y": pm.y}
                 for pm in self.placement
@@ -112,6 +117,8 @@ async def default_greedy_placement_runner(
     alpha = float(params.get("alpha", 1.0))
     beta = float(params.get("beta", 1.0))
 
+    from src.algorithms.greedy import greedy_placement
+
     result = greedy_placement(netlist, alpha=alpha, beta=beta)
     if not result.success or result.placement is None:
         raise PlacementError("Greedy placement failed to complete a legal placement.")
@@ -134,6 +141,8 @@ async def default_greedy_placement_runner(
             step=len(netlist.macros),
             total_steps=len(netlist.macros),
             current_hpwl=result.hpwl,
+            current_congestion=result.congestion,
+            current_objective=result.objective,
             placement=final_placement,
         )
     )
@@ -170,6 +179,8 @@ async def default_sa_placement_runner(
         shift_window = int(shift_window)
     move_weights = params.get("move_weights", None)
 
+    from src.algorithms.simulated_annealing import simulated_annealing
+
     result = simulated_annealing(
         netlist,
         initial_placement=initial_placement,
@@ -204,12 +215,103 @@ async def default_sa_placement_runner(
             step=len(netlist.macros),
             total_steps=len(netlist.macros),
             current_hpwl=result.hpwl,
+            current_congestion=result.congestion,
+            current_objective=result.objective,
             placement=final_placement,
         )
     )
     await asyncio.sleep(0.001)
 
     return final_placement
+
+
+async def default_rl_placement_runner(
+    netlist: Netlist,
+    seed: int,
+    params: dict[str, Any],
+    progress_cb: ProgressCallback,
+) -> Placement:
+    """Reinforcement Learning placement runner using MacroPlacementEnv / MaskablePPO.
+
+    Sequentially places macros using MacroPlacementEnv (which wraps PlacementEngine).
+    Uses a loaded MaskablePPO model if model_path is provided, or deterministic policy
+    action selection based on canonical action masking.
+    """
+    try:
+        from src.algorithms.rl_placement import (
+            MacroPlacementEnv,
+            _HAS_GYMNASIUM,
+            _HAS_SB3,
+        )
+    except ImportError as exc:
+        raise PlacementError(
+            f"Reinforcement Learning dependencies unavailable: {exc}"
+        ) from exc
+
+    if not _HAS_GYMNASIUM:
+        raise PlacementError(
+            "Reinforcement Learning requires 'gymnasium' to be installed. "
+            "Please install gymnasium>=1.4.0."
+        )
+
+    alpha = float(params.get("alpha", 1.0))
+    beta = float(params.get("beta", 1.0))
+    model_path = params.get("model_path", None)
+    deterministic = bool(params.get("deterministic", True))
+
+    model = None
+    if model_path and _HAS_SB3:
+        import os
+        from sb3_contrib import MaskablePPO
+
+        m_str = str(model_path)
+        if os.path.exists(m_str) or os.path.exists(f"{m_str}.zip"):
+            model = MaskablePPO.load(m_str)
+
+    env = MacroPlacementEnv(netlist=netlist, alpha=alpha, beta=beta)
+    obs, _info = env.reset(seed=seed)
+    total_steps = len(env.macros)
+    step = 0
+    done = False
+
+    while not done:
+        masks = env.action_masks()
+        if not np.any(masks):
+            raise PlacementError(
+                f"RL placement reached a dead end at step {step}/{total_steps} (no legal positions remain)."
+            )
+
+        if model is not None:
+            action, _states = model.predict(obs, action_masks=masks, deterministic=deterministic)
+            action_int = int(action)
+        else:
+            # Deterministic policy fallback: select first legal position according to action mask
+            action_int = int(np.where(masks)[0][0])
+
+        obs, reward, terminated, truncated, step_info = env.step(action_int)
+        step += 1
+        done = terminated or truncated
+
+        current_hpwl = step_info.get("hpwl", env.engine.current_hpwl(allow_incomplete=True))
+        await progress_cb(
+            JobProgress(
+                run_id="",
+                status="running",
+                progress=float(step / total_steps),
+                step=step,
+                total_steps=total_steps,
+                current_hpwl=current_hpwl,
+                placement=env.engine.get_placement(),
+            )
+        )
+        await asyncio.sleep(0.001)
+
+    if not env.engine.is_complete():
+        raise PlacementError(
+            f"RL placement failed to place all macros ({len(env.engine.placed_macros)}/{total_steps} placed)."
+        )
+
+    return env.engine.get_placement()
 
 
 def register_algorithm(name: str, runner: AlgorithmRunner) -> None:
@@ -238,6 +340,7 @@ register_algorithm("random", default_random_placement_runner)
 register_algorithm("greedy", default_greedy_placement_runner)
 register_algorithm("sa", default_sa_placement_runner)
 register_algorithm("simulated_annealing", default_sa_placement_runner)
+register_algorithm("rl", default_rl_placement_runner)
 
 
 class JobManager:
@@ -246,12 +349,17 @@ class JobManager:
     def __init__(self) -> None:
         """Initialize in-memory job store and subscriber queues."""
         self.jobs: dict[str, JobProgress] = {}
+        self.netlists: dict[str, Netlist] = {}
         self.subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
     def get_job(self, run_id: str) -> JobProgress | None:
         """Retrieve job progress by ID."""
         return self.jobs.get(run_id)
+
+    def get_netlist(self, run_id: str) -> Netlist | None:
+        """Retrieve original netlist for a job by ID."""
+        return self.netlists.get(run_id)
 
     def list_jobs(self) -> list[JobProgress]:
         """List all tracked jobs."""
@@ -318,7 +426,11 @@ class JobManager:
                     f"Errors: {list(report.errors)}. Placed: {report.placed_count}/{report.total_count}."
                 )
 
-            final_hpwl = calculate_hpwl(netlist, final_placement, allow_incomplete=False)
+            alpha = float(params.get("alpha", 1.0))
+            beta = float(params.get("beta", 1.0))
+            from .objective import evaluate_placement
+
+            eval_res = evaluate_placement(netlist, final_placement, alpha=alpha, beta=beta)
 
             completed_state = JobProgress(
                 run_id=run_id,
@@ -326,7 +438,9 @@ class JobManager:
                 progress=1.0,
                 step=len(netlist.macros),
                 total_steps=len(netlist.macros),
-                current_hpwl=final_hpwl,
+                current_hpwl=eval_res.hpwl,
+                current_congestion=eval_res.congestion,
+                current_objective=eval_res.objective,
                 placement=final_placement,
                 error=None,
             )
@@ -341,6 +455,8 @@ class JobManager:
                 step=self.jobs[run_id].step,
                 total_steps=len(netlist.macros),
                 current_hpwl=self.jobs[run_id].current_hpwl,
+                current_congestion=self.jobs[run_id].current_congestion,
+                current_objective=self.jobs[run_id].current_objective,
                 placement=self.jobs[run_id].placement,
                 error=str(exc),
             )
@@ -363,9 +479,12 @@ class JobManager:
             step=0,
             total_steps=len(netlist.macros),
             current_hpwl=None,
+            current_congestion=None,
+            current_objective=None,
             placement=[],
         )
         self.jobs[run_id] = initial_progress
+        self.netlists[run_id] = netlist
 
         task = asyncio.create_task(
             self._execute_job(

@@ -3,6 +3,8 @@
 import asyncio
 import csv
 import json
+import math
+import random
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -13,6 +15,7 @@ from .constraints import validate_placement
 from .hpwl import calculate_hpwl
 from .jobs import ALGORITHM_REGISTRY, JobProgress
 from .models import Macro, Net, Netlist
+from .objective import evaluate_placement
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,12 @@ class BenchmarkRunResult:
     hpwl: float | None
     runtime_sec: float
     error: str | None = None
+    congestion: float | None = None
+    objective: float | None = None
+    eval_time_sec: float | None = None
+    train_time_sec: float | None = None
+    train_timesteps: int | None = None
+    checkpoint_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert result to serializable dict."""
@@ -53,6 +62,8 @@ class BenchmarkSummary:
     std_hpwl: float | None
     mean_runtime_sec: float
     median_runtime_sec: float
+    mean_congestion: float | None = None
+    mean_objective: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert summary to serializable dict."""
@@ -132,10 +143,220 @@ def get_default_benchmark_suite() -> dict[str, Netlist]:
         ),
     )
 
+    # 4. Scaling instance: 20 macros (36x36 grid)
+    scaling_20 = Netlist(
+        version="1.0",
+        grid_w=36,
+        grid_h=36,
+        macros=(
+            Macro(id=0, w=6, h=5),
+            Macro(id=1, w=5, h=6),
+            Macro(id=2, w=7, h=5),
+            Macro(id=3, w=4, h=7),
+            Macro(id=4, w=5, h=5),
+            Macro(id=5, w=6, h=6),
+            Macro(id=6, w=7, h=4),
+            Macro(id=7, w=4, h=6),
+            Macro(id=8, w=5, h=4),
+            Macro(id=9, w=6, h=4),
+            Macro(id=10, w=5, h=7),
+            Macro(id=11, w=7, h=6),
+            Macro(id=12, w=6, h=5),
+            Macro(id=13, w=4, h=5),
+            Macro(id=14, w=5, h=6),
+            Macro(id=15, w=6, h=7),
+            Macro(id=16, w=4, h=4),
+            Macro(id=17, w=5, h=5),
+            Macro(id=18, w=7, h=5),
+            Macro(id=19, w=6, h=6),
+        ),
+        nets=(
+            Net(id=0, macro_ids=(0, 1, 2), weight=2.0),
+            Net(id=1, macro_ids=(1, 3), weight=1.0),
+            Net(id=2, macro_ids=(2, 4, 5), weight=1.5),
+            Net(id=3, macro_ids=(3, 6, 7), weight=1.0),
+            Net(id=4, macro_ids=(4, 7, 8), weight=2.0),
+            Net(id=5, macro_ids=(5, 8, 9), weight=1.5),
+            Net(id=6, macro_ids=(6, 10, 11), weight=2.5),
+            Net(id=7, macro_ids=(7, 11, 12), weight=1.0),
+            Net(id=8, macro_ids=(8, 12, 13), weight=1.5),
+            Net(id=9, macro_ids=(9, 13, 14), weight=2.0),
+            Net(id=10, macro_ids=(10, 14, 15), weight=1.0),
+            Net(id=11, macro_ids=(11, 15, 16), weight=2.0),
+            Net(id=12, macro_ids=(12, 16, 17), weight=1.5),
+            Net(id=13, macro_ids=(13, 17, 18), weight=1.0),
+            Net(id=14, macro_ids=(14, 18, 19), weight=2.5),
+            Net(id=15, macro_ids=(0, 5, 15), weight=1.5),
+            Net(id=16, macro_ids=(2, 9, 19), weight=2.0),
+            Net(id=17, macro_ids=(3, 10, 17), weight=1.0),
+        ),
+    )
+
+    # 5. Scaling instance: 30 macros (48x48 grid)
+    scaling_30 = Netlist(
+        version="1.0",
+        grid_w=48,
+        grid_h=48,
+        macros=(
+            Macro(id=0, w=6, h=5),
+            Macro(id=1, w=5, h=6),
+            Macro(id=2, w=7, h=5),
+            Macro(id=3, w=4, h=7),
+            Macro(id=4, w=5, h=5),
+            Macro(id=5, w=6, h=6),
+            Macro(id=6, w=7, h=4),
+            Macro(id=7, w=4, h=6),
+            Macro(id=8, w=5, h=4),
+            Macro(id=9, w=6, h=4),
+            Macro(id=10, w=5, h=7),
+            Macro(id=11, w=7, h=6),
+            Macro(id=12, w=6, h=5),
+            Macro(id=13, w=4, h=5),
+            Macro(id=14, w=5, h=6),
+            Macro(id=15, w=6, h=7),
+            Macro(id=16, w=4, h=4),
+            Macro(id=17, w=5, h=5),
+            Macro(id=18, w=7, h=5),
+            Macro(id=19, w=6, h=6),
+            Macro(id=20, w=5, h=5),
+            Macro(id=21, w=6, h=4),
+            Macro(id=22, w=4, h=6),
+            Macro(id=23, w=7, h=5),
+            Macro(id=24, w=5, h=7),
+            Macro(id=25, w=6, h=6),
+            Macro(id=26, w=4, h=5),
+            Macro(id=27, w=5, h=4),
+            Macro(id=28, w=7, h=6),
+            Macro(id=29, w=6, h=5),
+        ),
+        nets=(
+            Net(id=0, macro_ids=(0, 1, 2), weight=2.0),
+            Net(id=1, macro_ids=(1, 3), weight=1.0),
+            Net(id=2, macro_ids=(2, 4, 5), weight=1.5),
+            Net(id=3, macro_ids=(3, 6, 7), weight=1.0),
+            Net(id=4, macro_ids=(4, 7, 8), weight=2.0),
+            Net(id=5, macro_ids=(5, 8, 9), weight=1.5),
+            Net(id=6, macro_ids=(6, 10, 11), weight=2.5),
+            Net(id=7, macro_ids=(7, 11, 12), weight=1.0),
+            Net(id=8, macro_ids=(8, 12, 13), weight=1.5),
+            Net(id=9, macro_ids=(9, 13, 14), weight=2.0),
+            Net(id=10, macro_ids=(10, 14, 15), weight=1.0),
+            Net(id=11, macro_ids=(11, 15, 16), weight=2.0),
+            Net(id=12, macro_ids=(12, 16, 17), weight=1.5),
+            Net(id=13, macro_ids=(13, 17, 18), weight=1.0),
+            Net(id=14, macro_ids=(14, 18, 19), weight=2.5),
+            Net(id=15, macro_ids=(15, 19, 20), weight=1.5),
+            Net(id=16, macro_ids=(16, 20, 21), weight=2.0),
+            Net(id=17, macro_ids=(17, 21, 22), weight=1.0),
+            Net(id=18, macro_ids=(18, 22, 23), weight=1.5),
+            Net(id=19, macro_ids=(19, 23, 24), weight=2.0),
+            Net(id=20, macro_ids=(20, 24, 25), weight=1.0),
+            Net(id=21, macro_ids=(21, 25, 26), weight=2.5),
+            Net(id=22, macro_ids=(22, 26, 27), weight=1.5),
+            Net(id=23, macro_ids=(23, 27, 28), weight=2.0),
+            Net(id=24, macro_ids=(24, 28, 29), weight=1.0),
+            Net(id=25, macro_ids=(0, 10, 20), weight=2.0),
+            Net(id=26, macro_ids=(5, 15, 25), weight=1.5),
+            Net(id=27, macro_ids=(9, 19, 29), weight=2.5),
+        ),
+    )
+
     return {
         "toy_4": toy_4,
         "medium_8": medium_8,
         "dense_10": dense_10,
+        "scaling_20": scaling_20,
+        "scaling_30": scaling_30,
+    }
+
+
+def get_scaling_benchmark_suite() -> dict[str, Netlist]:
+    """Return benchmark netlists across scaling problem sizes (10, 20, 30 macros) for Experiment A."""
+    defaults = get_default_benchmark_suite()
+    return {
+        "dense_10": defaults["dense_10"],
+        "scaling_20": defaults["scaling_20"],
+        "scaling_30": defaults["scaling_30"],
+    }
+
+
+def generate_benchmark_netlist(
+    num_macros: int = 12,
+    grid_w: int = 30,
+    grid_h: int = 30,
+    connectivity: str = "random",
+    num_nets: int | None = None,
+    seed: int = 42,
+    num_clusters: int = 3,
+) -> Netlist:
+    """Deterministically generate a synthetic benchmark netlist with controlled connectivity."""
+    rng = random.Random(seed)
+    n_nets = num_nets if num_nets is not None else int(1.2 * num_macros)
+    macros: list[Macro] = []
+    for i in range(num_macros):
+        w = rng.randint(3, min(7, max(3, grid_w // 3)))
+        h = rng.randint(3, min(7, max(3, grid_h // 3)))
+        macros.append(Macro(id=i, w=w, h=h))
+
+    nets: list[Net] = []
+    if connectivity == "clustered":
+        n_clusters = max(1, min(num_clusters, num_macros))
+        clusters: list[list[int]] = [[] for _ in range(n_clusters)]
+        for i in range(num_macros):
+            clusters[i % n_clusters].append(i)
+        for nid in range(n_nets):
+            eligible = [c for c in clusters if len(c) >= 2]
+            if rng.random() < 0.75 and eligible:
+                c = rng.choice(eligible)
+                k = min(len(c), rng.randint(2, 4))
+                mids = tuple(sorted(rng.sample(c, k)))
+            elif len(clusters) >= 2:
+                c1, c2 = rng.sample(clusters, 2)
+                mids = tuple(sorted([rng.choice(c1), rng.choice(c2)]))
+            else:
+                k = min(num_macros, rng.randint(2, max(2, min(4, num_macros))))
+                mids = tuple(sorted(rng.sample(range(num_macros), k)))
+            wt = rng.choice([1.0, 1.5, 2.0])
+            nets.append(Net(id=nid, macro_ids=mids, weight=wt))
+    else:
+        for nid in range(n_nets):
+            k = rng.randint(2, min(4, num_macros))
+            mids = tuple(sorted(rng.sample(range(num_macros), k)))
+            wt = rng.choice([1.0, 1.5, 2.0])
+            nets.append(Net(id=nid, macro_ids=mids, weight=wt))
+
+    return Netlist(
+        version="1.0",
+        grid_w=grid_w,
+        grid_h=grid_h,
+        macros=tuple(macros),
+        nets=tuple(nets),
+    )
+
+
+def get_connectivity_benchmark_suite(
+    num_macros: int = 12,
+    seed: int = 42,
+) -> dict[str, Netlist]:
+    """Return paired random and clustered netlists with identical macro dimensions for Experiment B."""
+    grid_size = max(24, int(math.ceil(math.sqrt(num_macros * 25 * 2.5))))
+    nl_rand = generate_benchmark_netlist(
+        num_macros=num_macros,
+        grid_w=grid_size,
+        grid_h=grid_size,
+        connectivity="random",
+        seed=seed,
+    )
+    nl_clust = generate_benchmark_netlist(
+        num_macros=num_macros,
+        grid_w=grid_size,
+        grid_h=grid_size,
+        connectivity="clustered",
+        seed=seed,
+    )
+    return {
+        f"exp_b_{num_macros}_random": nl_rand,
+        f"exp_b_{num_macros}_clustered": nl_clust,
     }
 
 
@@ -192,7 +413,24 @@ async def execute_single_benchmark_run(
                 error=f"Illegal or incomplete placement: {list(report.errors)}",
             )
 
-        hpwl = calculate_hpwl(netlist, placement, allow_incomplete=False)
+        alpha = float(cfg.get("alpha", 1.0))
+        beta = float(cfg.get("beta", 1.0))
+        eval_res = evaluate_placement(netlist, placement, alpha=alpha, beta=beta)
+        hpwl = eval_res.hpwl
+        congestion = eval_res.congestion
+        objective = eval_res.objective
+
+        eval_time_sec = float(cfg.get("eval_time_sec", elapsed))
+        train_time_sec = cfg.get("train_time_sec", None)
+        if train_time_sec is not None:
+            train_time_sec = float(train_time_sec)
+        train_timesteps = cfg.get("train_timesteps", None)
+        if train_timesteps is not None:
+            train_timesteps = int(train_timesteps)
+        checkpoint_path = cfg.get("checkpoint_path", None)
+        if checkpoint_path is not None:
+            checkpoint_path = str(checkpoint_path)
+
         return BenchmarkRunResult(
             algorithm=algorithm,
             config=cfg,
@@ -206,6 +444,12 @@ async def execute_single_benchmark_run(
             hpwl=hpwl,
             runtime_sec=elapsed,
             error=None,
+            congestion=congestion,
+            objective=objective,
+            eval_time_sec=eval_time_sec,
+            train_time_sec=train_time_sec,
+            train_timesteps=train_timesteps,
+            checkpoint_path=checkpoint_path,
         )
 
     except Exception as exc:  # noqa: BLE001
@@ -255,17 +499,25 @@ def compute_benchmark_summaries(
 
         if successful_runs:
             hpwls = [float(r.hpwl) for r in successful_runs if r.hpwl is not None]
-            mean_hpwl = float(statistics.mean(hpwls))
-            median_hpwl = float(statistics.median(hpwls))
-            min_hpwl = float(min(hpwls))
-            max_hpwl = float(max(hpwls))
+            congestions = [float(r.congestion) for r in successful_runs if r.congestion is not None]
+            objectives = [float(r.objective) for r in successful_runs if r.objective is not None]
+
+            mean_hpwl = float(statistics.mean(hpwls)) if hpwls else None
+            median_hpwl = float(statistics.median(hpwls)) if hpwls else None
+            min_hpwl = float(min(hpwls)) if hpwls else None
+            max_hpwl = float(max(hpwls)) if hpwls else None
             std_hpwl = float(statistics.stdev(hpwls)) if len(hpwls) > 1 else 0.0
+
+            mean_congestion = float(statistics.mean(congestions)) if congestions else None
+            mean_objective = float(statistics.mean(objectives)) if objectives else None
         else:
             mean_hpwl = None
             median_hpwl = None
             min_hpwl = None
             max_hpwl = None
             std_hpwl = None
+            mean_congestion = None
+            mean_objective = None
 
         summaries.append(
             BenchmarkSummary(
@@ -281,6 +533,8 @@ def compute_benchmark_summaries(
                 std_hpwl=std_hpwl,
                 mean_runtime_sec=mean_runtime,
                 median_runtime_sec=median_runtime,
+                mean_congestion=mean_congestion,
+                mean_objective=mean_objective,
             )
         )
 
@@ -307,14 +561,23 @@ def write_benchmark_reports(
         writer = csv.writer(f)
         writer.writerow([
             "algorithm", "netlist_id", "grid_w", "grid_h", "seed",
-            "success", "is_legal", "is_complete", "hpwl", "runtime_sec", "error",
+            "success", "is_legal", "is_complete", "hpwl", "congestion", "objective",
+            "runtime_sec", "eval_time_sec", "train_time_sec", "train_timesteps",
+            "checkpoint_path", "error",
         ])
         for r in results:
             writer.writerow([
                 r.algorithm, r.netlist_id, r.grid_w, r.grid_h, r.seed,
                 r.success, r.is_legal, r.is_complete,
                 f"{r.hpwl:.4f}" if r.hpwl is not None else "",
-                f"{r.runtime_sec:.6f}", r.error or "",
+                f"{r.congestion:.6f}" if r.congestion is not None else "",
+                f"{r.objective:.4f}" if r.objective is not None else "",
+                f"{r.runtime_sec:.6f}",
+                f"{r.eval_time_sec:.6f}" if r.eval_time_sec is not None else "",
+                f"{r.train_time_sec:.6f}" if r.train_time_sec is not None else "",
+                str(r.train_timesteps) if r.train_timesteps is not None else "",
+                r.checkpoint_path or "",
+                r.error or "",
             ])
 
     # Write summary JSON
@@ -329,6 +592,7 @@ def write_benchmark_reports(
         writer.writerow([
             "algorithm", "netlist_id", "total_runs", "success_count", "success_rate",
             "mean_hpwl", "median_hpwl", "min_hpwl", "max_hpwl", "std_hpwl",
+            "mean_congestion", "mean_objective",
             "mean_runtime_sec", "median_runtime_sec",
         ])
         for s in summaries:
@@ -339,6 +603,8 @@ def write_benchmark_reports(
                 f"{s.min_hpwl:.4f}" if s.min_hpwl is not None else "",
                 f"{s.max_hpwl:.4f}" if s.max_hpwl is not None else "",
                 f"{s.std_hpwl:.4f}" if s.std_hpwl is not None else "",
+                f"{s.mean_congestion:.6f}" if s.mean_congestion is not None else "",
+                f"{s.mean_objective:.4f}" if s.mean_objective is not None else "",
                 f"{s.mean_runtime_sec:.6f}", f"{s.median_runtime_sec:.6f}",
             ])
 
