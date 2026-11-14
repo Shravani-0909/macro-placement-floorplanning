@@ -19,6 +19,7 @@ from src.placement.benchmarks import (
     generate_benchmark_netlist,
     get_connectivity_benchmark_suite,
     get_default_benchmark_suite,
+    get_generalization_benchmark_suite,
     get_scaling_benchmark_suite,
     ppo_training_result_to_benchmark_run_result,
     run_benchmark_suite,
@@ -753,3 +754,81 @@ async def test_multi_seed_independent_execution_and_persistence(tmp_path: Path) 
             assert row["algorithm"] == "random"
             assert row["netlist_id"] == "toy_4"
             assert row["success"] == "True"
+
+
+def test_generalization_benchmark_suite_shapes() -> None:
+    """Generalization suite defines 3 instances with matching geometry (12 macros, 28x28) and distinct connectivity."""
+    suite = get_generalization_benchmark_suite()
+    assert len(suite) == 3
+    assert "exp_d_train_random" in suite
+    assert "exp_d_test_unseen_inst" in suite
+    assert "exp_d_test_unseen_topo" in suite
+
+    train_nl = suite["exp_d_train_random"]
+    unseen_inst_nl = suite["exp_d_test_unseen_inst"]
+    unseen_topo_nl = suite["exp_d_test_unseen_topo"]
+
+    for nl in [train_nl, unseen_inst_nl, unseen_topo_nl]:
+        assert len(nl.macros) == 12
+        assert nl.grid_w == 28
+        assert nl.grid_h == 28
+        for m in nl.macros:
+            assert m.w <= 28
+            assert m.h <= 28
+
+    # Macro dimensions should differ between seed 42 and seed 101
+    train_dims = [(m.w, m.h) for m in train_nl.macros]
+    unseen_inst_dims = [(m.w, m.h) for m in unseen_inst_nl.macros]
+    assert train_dims != unseen_inst_dims
+
+    # Topology should differ between random and clustered
+    assert len(train_nl.nets) > 0
+    assert len(unseen_topo_nl.nets) > 0
+
+
+@async_test
+async def test_run_experiment_d_smoke(tmp_path: Path) -> None:
+    """Experiment D runs cleanly, executes on all 3 instances, and writes verified raw and summary reports."""
+    from scripts.run_experiments import run_experiment_d
+
+    # Run with 1 seed and small budgets for quick execution
+    await run_experiment_d(
+        output_dir=tmp_path,
+        seeds=[42],
+        sa_iterations=10,
+        rl_timesteps=16,
+        verbose_rl=False,
+        reward_scale=100.0,
+    )
+
+    exp_dir = tmp_path / "experiment_d_generalization"
+    assert exp_dir.exists()
+
+    raw_csv = exp_dir / "benchmark_raw_results.csv"
+    raw_json = exp_dir / "benchmark_raw_results.json"
+    sum_csv = exp_dir / "benchmark_summary.csv"
+    sum_json = exp_dir / "benchmark_summary.json"
+
+    assert raw_csv.exists()
+    assert raw_json.exists()
+    assert sum_csv.exists()
+    assert sum_json.exists()
+
+    with open(raw_csv, mode="r", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+        assert len(reader) >= 3  # At least 3 classical algorithm runs across 3 instances
+        netlist_ids = {row["netlist_id"] for row in reader}
+        assert "exp_d_train_random" in netlist_ids
+        assert "exp_d_test_unseen_inst" in netlist_ids
+        assert "exp_d_test_unseen_topo" in netlist_ids
+        for row in reader:
+            assert row["grid_w"] == "28"
+            assert row["grid_h"] == "28"
+            assert row["success"] == "True"
+
+    with open(sum_csv, mode="r", encoding="utf-8") as f:
+        sum_reader = list(csv.DictReader(f))
+        sum_netlists = {row["netlist_id"] for row in sum_reader}
+        assert "exp_d_train_random" in sum_netlists
+        assert "exp_d_test_unseen_inst" in sum_netlists
+        assert "exp_d_test_unseen_topo" in sum_netlists

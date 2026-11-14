@@ -364,6 +364,44 @@ def get_connectivity_benchmark_suite(
     }
 
 
+def get_generalization_benchmark_suite(
+    num_macros: int = 12,
+    grid_size: int = 28,
+) -> dict[str, Netlist]:
+    """Return benchmark netlists for Experiment D (RL Generalization / Robustness).
+
+    Includes:
+    1. exp_d_train_random: Training instance (random connectivity, seed=42)
+    2. exp_d_test_unseen_inst: In-distribution unseen instance (random connectivity, seed=101)
+    3. exp_d_test_unseen_topo: Out-of-distribution unseen topology instance (clustered connectivity, seed=202)
+
+    All three share identical dimensions (12 macros, 28x28 grid) to match frozen RL policy dimensions.
+    """
+    return {
+        "exp_d_train_random": generate_benchmark_netlist(
+            num_macros=num_macros,
+            grid_w=grid_size,
+            grid_h=grid_size,
+            connectivity="random",
+            seed=42,
+        ),
+        "exp_d_test_unseen_inst": generate_benchmark_netlist(
+            num_macros=num_macros,
+            grid_w=grid_size,
+            grid_h=grid_size,
+            connectivity="random",
+            seed=101,
+        ),
+        "exp_d_test_unseen_topo": generate_benchmark_netlist(
+            num_macros=num_macros,
+            grid_w=grid_size,
+            grid_h=grid_size,
+            connectivity="clustered",
+            seed=202,
+        ),
+    }
+
+
 def ppo_training_result_to_benchmark_run_result(
     training_result: Any,
     netlist: Netlist,

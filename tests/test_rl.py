@@ -457,6 +457,100 @@ def test_ppo_training_checkpoint_lifecycle(simple_netlist: Netlist, tmp_path: Pa
     assert len(eval_res.placement) == len(simple_netlist.macros)
 
 
+@needs_sb3
+def test_cross_instance_ppo_evaluation_lifecycle(tmp_path: Path) -> None:
+    """Train smoke PPO on exp_d_train_random, evaluate on unseen instance, verify no training/gradient updates."""
+    import torch
+    from sb3_contrib import MaskablePPO
+    from src.algorithms.rl_placement import PPOTrainingConfig, evaluate_ppo, train_ppo
+    from src.placement.benchmarks import get_generalization_benchmark_suite
+
+    suite = get_generalization_benchmark_suite()
+    train_nl = suite["exp_d_train_random"]
+    unseen_nl = suite["exp_d_test_unseen_inst"]
+
+    cfg = PPOTrainingConfig(
+        total_timesteps=16,
+        n_steps=16,
+        batch_size=16,
+        seed=42,
+        verbose=0,
+    )
+    checkpoint_file = tmp_path / "exp_d_smoke_ppo.zip"
+
+    train_res = train_ppo(
+        train_nl,
+        config=cfg,
+        checkpoint_path=checkpoint_file,
+    )
+    assert Path(train_res.checkpoint_path).exists()
+
+    # Load model and snapshot parameters before evaluation
+    model = MaskablePPO.load(str(checkpoint_file))
+    params_before = [p.clone() for p in model.policy.parameters()]
+
+    # Evaluate deterministically on unseen instance
+    eval_res = evaluate_ppo(
+        unseen_nl,
+        model_or_path=model,
+        seed=42,
+        deterministic=True,
+    )
+    assert eval_res.feasible is True
+    assert eval_res.hpwl is not None and eval_res.hpwl > 0.0
+    assert eval_res.objective is not None and eval_res.objective > 0.0
+    assert len(eval_res.placement) == len(unseen_nl.macros)
+
+    # Snapshot parameters after evaluation and verify exact equality (zero parameter updates)
+    params_after = [p for p in model.policy.parameters()]
+    assert len(params_before) == len(params_after)
+    for pb, pa in zip(params_before, params_after):
+        assert torch.equal(pb, pa)
+
+
+@needs_sb3
+def test_dimension_mismatch_detection(tmp_path: Path) -> None:
+    """Evaluating a trained PPO model on mismatched macro count or grid size fails explicitly."""
+    from sb3_contrib import MaskablePPO
+    from src.algorithms.rl_placement import PPOTrainingConfig, evaluate_ppo, train_ppo
+    from src.placement.benchmarks import generate_benchmark_netlist, get_generalization_benchmark_suite
+
+    suite = get_generalization_benchmark_suite()
+    train_nl = suite["exp_d_train_random"]
+
+    cfg = PPOTrainingConfig(
+        total_timesteps=16,
+        n_steps=16,
+        batch_size=16,
+        seed=42,
+        verbose=0,
+    )
+    checkpoint_file = tmp_path / "mismatch_test_ppo.zip"
+    train_ppo(train_nl, config=cfg, checkpoint_path=checkpoint_file)
+
+    model = MaskablePPO.load(str(checkpoint_file))
+
+    # 1. Mismatched macro count: N=10 vs trained N=12
+    mismatched_macro_nl = generate_benchmark_netlist(
+        num_macros=10,
+        grid_w=28,
+        grid_h=28,
+        seed=42,
+    )
+    with pytest.raises((RuntimeError, ValueError, IndexError, Exception)):
+        evaluate_ppo(mismatched_macro_nl, model_or_path=model)
+
+    # 2. Mismatched grid size: 32x32 vs trained 28x28
+    mismatched_grid_nl = generate_benchmark_netlist(
+        num_macros=12,
+        grid_w=32,
+        grid_h=32,
+        seed=42,
+    )
+    with pytest.raises((RuntimeError, ValueError, IndexError, Exception)):
+        evaluate_ppo(mismatched_grid_nl, model_or_path=model)
+
+
 def test_compute_connectivity_features_shape_and_range() -> None:
     """compute_connectivity_features returns correctly shaped, bounded float32 array."""
     macros = (

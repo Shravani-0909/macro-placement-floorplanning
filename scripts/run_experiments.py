@@ -37,6 +37,7 @@ from src.placement.benchmarks import (
     generate_benchmark_netlist,
     get_connectivity_benchmark_suite,
     get_default_benchmark_suite,
+    get_generalization_benchmark_suite,
     get_scaling_benchmark_suite,
     ppo_training_result_to_benchmark_run_result,
     write_benchmark_reports,
@@ -370,81 +371,119 @@ async def run_experiment_b(
 async def run_experiment_d(
     output_dir: Path,
     seeds: list[int],
-    sa_budgets: list[int] | None = None,
-    rl_budgets: list[int] | None = None,
+    sa_iterations: int = 1000,
+    rl_timesteps: int = 10000,
     verbose_rl: bool = False,
-    reward_scale: float = 1.0,
+    reward_scale: float = 100.0,
 ) -> None:
-    """Experiment D: SA Search Budget vs. RL Training Cost Tradeoff."""
+    """Experiment D: RL Generalization / Robustness (Train on random, zero-shot test on unseen instance and topology)."""
     print("\n" + "=" * 60)
-    print("EXPERIMENT D: SA Search Budget vs. RL Training Cost Tradeoff")
+    print("EXPERIMENT D: RL Generalization / Robustness")
     print("=" * 60)
-    exp_dir = output_dir / "experiment_d_budget_tradeoff"
+    exp_dir = output_dir / "experiment_d_generalization"
     exp_dir.mkdir(parents=True, exist_ok=True)
 
-    suite = get_default_benchmark_suite()
-    netlist_id = "dense_10"
-    netlist = suite[netlist_id]
-
-    if sa_budgets is None:
-        sa_budgets = [200, 500, 1000, 3000]
-    if rl_budgets is None:
-        rl_budgets = [2000, 10000, 25000]
+    suite = get_generalization_benchmark_suite(num_macros=12, grid_size=28)
+    train_netlist_id = "exp_d_train_random"
+    train_netlist = suite[train_netlist_id]
 
     results: list[BenchmarkRunResult] = []
 
-    # 1. Sweep SA budgets
-    print(f"\nSweeping Simulated Annealing Iteration Budgets on {netlist_id}...")
-    for iters in sa_budgets:
-        for s in seeds:
-            set_seed(s)
-            cfg = {"max_iterations": iters}
-            res = await execute_single_benchmark_run("sa", netlist_id, netlist, s, config=cfg)
-            results.append(res)
-            print(f"  [SA budget={iters:5d}] seed={s:4d} | HPWL={res.hpwl:.1f} | Obj={res.objective:.2f} | Time={res.runtime_sec:.3f}s")
-
-    # 2. Sweep RL training budgets (if available)
+    # Algorithms to compare
+    algos = ["random", "greedy", "sa"]
     if _RL_READY:
+        algos.append("rl")
+
+    # Step 1: Train PPO once per seed ONLY on exp_d_train_random
+    rl_checkpoints: dict[int, tuple[str, float, Any]] = {}
+    if _RL_READY and "rl" in algos:
         from src.algorithms.rl_placement import PPOTrainingConfig, train_ppo
 
-        print(f"\nSweeping RL PPO Training Timestep Budgets on {netlist_id}...")
-        for steps in rl_budgets:
+        print(f"\nPhase 1: Training PPO on {train_netlist_id} (Seeds: {seeds})...")
+        for s in seeds:
+            print(f"  Training PPO on {train_netlist_id} (seed={s}, timesteps={rl_timesteps}, reward_scale={reward_scale})...", end="", flush=True)
+            ckpt_path = exp_dir / "checkpoints" / f"ppo_exp_d_train_s{s}.zip"
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg = PPOTrainingConfig(
+                total_timesteps=rl_timesteps,
+                seed=s,
+                verbose=1 if verbose_rl else 0,
+                reward_scale=reward_scale,
+            )
+            t_res = train_ppo(train_netlist, config=cfg, checkpoint_path=ckpt_path)
+            rl_checkpoints[s] = (str(ckpt_path), t_res.training_time_s, t_res)
+            print(f" Done ({t_res.training_time_s:.1f}s)")
+    elif "rl" in algos:
+        print("\nSkipping RL training (RL dependencies missing/blocked).")
+
+    # Step 2: Zero-shot evaluation of all algorithms across all 3 benchmark instances
+    print("\nPhase 2: Evaluating Algorithms across Benchmark Suite (Train + Unseen Holdouts)...")
+    for netlist_id, netlist in suite.items():
+        role = "TRAIN EVAL" if netlist_id == train_netlist_id else ("UNSEEN INSTANCE" if "unseen_inst" in netlist_id else "UNSEEN TOPOLOGY")
+        print(f"\nEvaluating on {netlist_id} [{role}]:")
+
+        for algo in algos:
             for s in seeds:
                 set_seed(s)
-                ckpt_path = exp_dir / "checkpoints" / f"ppo_{netlist_id}_t{steps}_s{s}.zip"
-                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-                cfg_train = PPOTrainingConfig(
-                    total_timesteps=steps,
-                    seed=s,
-                    verbose=1 if verbose_rl else 0,
-                    reward_scale=reward_scale,
-                )
-                t_res = train_ppo(netlist, config=cfg_train, checkpoint_path=ckpt_path)
+                cfg: dict[str, Any] = {}
+                if algo == "sa":
+                    cfg["max_iterations"] = sa_iterations
+                elif algo == "rl" and s in rl_checkpoints:
+                    ckpt, t_time, _ = rl_checkpoints[s]
+                    cfg["model_path"] = ckpt
+                    cfg["checkpoint_path"] = ckpt
+                    cfg["train_time_sec"] = t_time
+                    cfg["train_timesteps"] = rl_timesteps
 
-                cfg_eval = {
-                    "model_path": str(ckpt_path),
-                    "checkpoint_path": str(ckpt_path),
-                    "train_time_sec": t_res.training_time_s,
-                    "train_timesteps": steps,
-                }
-                res = await execute_single_benchmark_run("rl", netlist_id, netlist, s, config=cfg_eval)
-                if not res.success and getattr(t_res.eval_result, "feasible", False):
+                res = await execute_single_benchmark_run(algo, netlist_id, netlist, s, config=cfg)
+                if (
+                    algo == "rl"
+                    and not res.success
+                    and s in rl_checkpoints
+                    and netlist_id == train_netlist_id
+                    and getattr(rl_checkpoints[s][2].eval_result, "feasible", False)
+                ):
                     res = ppo_training_result_to_benchmark_run_result(
-                        t_res,
+                        rl_checkpoints[s][2],
                         netlist,
                         netlist_id=netlist_id,
-                        config=cfg_eval,
+                        config=cfg,
                     )
                 results.append(res)
-                print(
-                    f"  [RL steps={steps:6d}] seed={s:4d} | TrainTime={t_res.training_time_s:.2f}s | "
-                    f"EvalTime={res.runtime_sec*1000:.1f}ms | HPWL={res.hpwl:.1f} | Obj={res.objective:.2f}"
-                )
-    else:
-        print("\nSkipping RL budget sweep (RL dependencies missing/blocked).")
+                status = "OK" if res.success else "FAILED"
+                hpwl_str = f"HPWL={res.hpwl:.1f}" if res.hpwl is not None else "N/A"
+                c_str = f"Cong={res.congestion:.4f}" if res.congestion is not None else "N/A"
+                obj_str = f"Obj={res.objective:.2f}" if res.objective is not None else "N/A"
+                print(f"  [{algo.upper():6s}] seed={s:4d} | {status:6s} | {hpwl_str} | {c_str} | {obj_str} | {res.runtime_sec*1000:.1f}ms")
 
     summaries = compute_benchmark_summaries(results)
     write_benchmark_reports(results, summaries, exp_dir)
+
+    # Generalization Gap Reporting
+    print("\n" + "=" * 60)
+    print("EXPERIMENT D GENERALIZATION GAPS")
+    print("=" * 60)
+    summary_map = {(s.algorithm, s.netlist_id): s for s in summaries}
+    for algo in algos:
+        train_s = summary_map.get((algo, "exp_d_train_random"))
+        unseen_inst_s = summary_map.get((algo, "exp_d_test_unseen_inst"))
+        unseen_topo_s = summary_map.get((algo, "exp_d_test_unseen_topo"))
+
+        if train_s and unseen_inst_s and unseen_topo_s:
+            if train_s.mean_objective is not None and unseen_inst_s.mean_objective is not None:
+                delta_inst = unseen_inst_s.mean_objective - train_s.mean_objective
+                delta_inst_str = f"{delta_inst:+.2f}"
+            else:
+                delta_inst_str = "N/A"
+
+            if train_s.mean_objective is not None and unseen_topo_s.mean_objective is not None:
+                delta_topo = unseen_topo_s.mean_objective - train_s.mean_objective
+                delta_topo_str = f"{delta_topo:+.2f}"
+            else:
+                delta_topo_str = "N/A"
+
+            print(f"  [{algo.upper():6s}] ΔJ_inst (unseen instance gap): {delta_inst_str:>8s} | ΔJ_topo (unseen topology gap): {delta_topo_str:>8s}")
+
     print(f"\nExperiment D complete. Results written to {exp_dir}")
 
 
@@ -466,13 +505,13 @@ def parse_seeds_list(raw_seeds: Sequence[str | int]) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run macro placement experiments (A: Scaling, B: Connectivity, D: Budget Tradeoff)."
+        description="Run macro placement experiments (A: Scaling, B: Connectivity, D: RL Generalization / Robustness)."
     )
     parser.add_argument(
         "--experiment",
         choices=["A", "B", "D", "all", "smoke"],
         default="all",
-        help="Experiment to run: A (Scaling), B (Connectivity), D (Budget Tradeoff), all, or smoke.",
+        help="Experiment to run: A (Scaling), B (Connectivity), D (Generalization / Robustness), all, or smoke.",
     )
     parser.add_argument(
         "--smoke",
@@ -565,6 +604,8 @@ def main() -> None:
             run_experiment_d(
                 out_dir,
                 seeds,
+                sa_iterations=args.sa_iterations,
+                rl_timesteps=args.timesteps,
                 verbose_rl=args.verbose_rl,
                 reward_scale=args.reward_scale,
             )
