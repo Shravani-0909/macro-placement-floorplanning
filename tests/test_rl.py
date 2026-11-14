@@ -646,20 +646,130 @@ def test_reward_scale_and_features_dim_validation() -> None:
         PPOTrainingConfig(features_dim=-10).validate()
 
 
+def test_reward_scaling_mathematical_properties() -> None:
+    """Pure mathematical verification of reward scaling formula R' = R / S."""
+    raw_delta = 145.5
+    S = 100.0
+
+    # Test A: Scale identity when S = 1.0
+    assert raw_delta / 1.0 == raw_delta
+
+    # Test B: Scaled reward
+    assert np.isclose(raw_delta / S, 1.455)
+
+    # Test C: Ordering preservation
+    delta_A = 250.0
+    delta_B = 120.0
+    assert delta_A > delta_B
+    assert (delta_A / S) > (delta_B / S)
+
+    # Test E: Penalty scaling preservation
+    penalty = 50.0
+    assert np.isclose((raw_delta - penalty) / S, raw_delta / S - penalty / S)
+
+
 @needs_gym
-def test_env_reward_scaling(simple_netlist: Netlist) -> None:
-    """reward_scale scales step reward proportionally."""
-    env_unscaled = MacroPlacementEnv(netlist=simple_netlist, reward_scale=1.0)
-    env_unscaled.reset()
-    env_unscaled.current_objective = 100.0
-    _, reward_unscaled, _, _, _ = env_unscaled.step(0)
+def test_reward_scale_identity_and_scaling(simple_netlist: Netlist) -> None:
+    """Test A & B: reward_scale=1 preserves raw reward; S=100 scales as raw_reward / S."""
+    env_raw = MacroPlacementEnv(netlist=simple_netlist, reward_scale=1.0)
+    env_raw.reset(seed=42)
+    env_raw.current_objective = 50.0
+    obs_raw, reward_raw, term_raw, trunc_raw, info_raw = env_raw.step(0)
 
-    env_scaled = MacroPlacementEnv(netlist=simple_netlist, reward_scale=0.1)
-    env_scaled.reset()
+    # Expected raw step delta: previous_J - new_J = 50.0 - info_raw['objective']
+    expected_raw = 50.0 - float(info_raw["objective"])
+    assert np.isclose(reward_raw, expected_raw)  # Test A: Scale identity
+
+    # Scaled environment with S = 100.0
+    env_scaled = MacroPlacementEnv(netlist=simple_netlist, reward_scale=100.0)
+    env_scaled.reset(seed=42)
+    env_scaled.current_objective = 50.0
+    obs_scaled, reward_scaled, term_scaled, trunc_scaled, info_scaled = env_scaled.step(0)
+
+    # Test B: Scaled reward == raw_reward / S
+    assert np.isclose(reward_scaled, reward_raw / 100.0)
+    # Test D: Objective equivalence (reported placement objective unchanged by scaling)
+    assert info_raw["objective"] == info_scaled["objective"]
+    assert info_raw["hpwl"] == info_scaled["hpwl"]
+    assert info_raw["congestion"] == info_scaled["congestion"]
+
+
+@needs_gym
+def test_reward_scale_ordering(simple_netlist: Netlist) -> None:
+    """Test C: raw_reward_A > raw_reward_B implies scaled_reward_A > scaled_reward_B."""
+    env_raw = MacroPlacementEnv(netlist=simple_netlist, reward_scale=1.0)
+    env_scaled = MacroPlacementEnv(netlist=simple_netlist, reward_scale=100.0)
+
+    # Transition A: prior objective = 100.0
+    env_raw.reset(seed=42)
+    env_raw.current_objective = 100.0
+    _, reward_raw_A, _, _, _ = env_raw.step(0)
+
+    # Transition B: prior objective = 10.0
+    env_raw.reset(seed=42)
+    env_raw.current_objective = 10.0
+    _, reward_raw_B, _, _, _ = env_raw.step(0)
+
+    assert reward_raw_A > reward_raw_B
+
+    # Same transitions under scaled environment
+    env_scaled.reset(seed=42)
     env_scaled.current_objective = 100.0
-    _, reward_scaled, _, _, _ = env_scaled.step(0)
+    _, reward_scaled_A, _, _, _ = env_scaled.step(0)
 
-    assert np.isclose(reward_scaled, 0.1 * reward_unscaled)
+    env_scaled.reset(seed=42)
+    env_scaled.current_objective = 10.0
+    _, reward_scaled_B, _, _, _ = env_scaled.step(0)
+
+    assert reward_scaled_A > reward_scaled_B
+    assert np.isclose(reward_scaled_A, reward_raw_A / 100.0)
+    assert np.isclose(reward_scaled_B, reward_raw_B / 100.0)
+
+
+@needs_gym
+def test_reward_scale_penalties_consistent(simple_netlist: Netlist, tight_netlist: Netlist) -> None:
+    """Test E: Terminal bonus, dead-end penalty, and illegal penalty scale consistently."""
+    S = 100.0
+
+    # 1. Terminal bonus on completion
+    env_raw_term = MacroPlacementEnv(netlist=simple_netlist, reward_scale=1.0, terminal_bonus=50.0)
+    env_raw_term.reset()
+    env_raw_term.step(0)
+    _, r_raw_term, term, _, _ = env_raw_term.step(coord_to_action(2, 2, env_raw_term.grid_w))
+    assert term is True
+
+    env_scaled_term = MacroPlacementEnv(netlist=simple_netlist, reward_scale=S, terminal_bonus=50.0)
+    env_scaled_term.reset()
+    env_scaled_term.step(0)
+    _, r_scaled_term, _, _, _ = env_scaled_term.step(coord_to_action(2, 2, env_scaled_term.grid_w))
+
+    assert np.isclose(r_scaled_term, r_raw_term / S)
+
+    # 2. Illegal action penalty
+    env_raw_illegal = MacroPlacementEnv(netlist=simple_netlist, reward_scale=1.0, illegal_action_penalty=40.0)
+    env_raw_illegal.reset()
+    _, r_raw_illegal, _, _, _ = env_raw_illegal.step(35)  # illegal out of bounds
+
+    env_scaled_illegal = MacroPlacementEnv(netlist=simple_netlist, reward_scale=S, illegal_action_penalty=40.0)
+    env_scaled_illegal.reset()
+    _, r_scaled_illegal, _, _, _ = env_scaled_illegal.step(35)
+
+    assert np.isclose(r_scaled_illegal, r_raw_illegal / S)
+    assert np.isclose(r_raw_illegal, -40.0)
+    assert np.isclose(r_scaled_illegal, -40.0 / S)
+
+    # 3. Dead-end penalty
+    env_raw_dead = MacroPlacementEnv(netlist=tight_netlist, reward_scale=1.0, dead_end_penalty=30.0)
+    env_raw_dead.reset()
+    _, r_raw_dead, _, trunc_raw, _ = env_raw_dead.step(0)
+    assert trunc_raw is True
+
+    env_scaled_dead = MacroPlacementEnv(netlist=tight_netlist, reward_scale=S, dead_end_penalty=30.0)
+    env_scaled_dead.reset()
+    _, r_scaled_dead, _, trunc_scaled, _ = env_scaled_dead.step(0)
+    assert trunc_scaled is True
+
+    assert np.isclose(r_scaled_dead, r_raw_dead / S)
 
 
 def test_classical_neutrality_preserved(simple_netlist: Netlist) -> None:
