@@ -63,7 +63,11 @@ class BenchmarkSummary:
     mean_runtime_sec: float
     median_runtime_sec: float
     mean_congestion: float | None = None
+    median_congestion: float | None = None
+    std_congestion: float | None = None
     mean_objective: float | None = None
+    median_objective: float | None = None
+    std_objective: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert summary to serializable dict."""
@@ -578,7 +582,11 @@ def compute_benchmark_summaries(
             std_hpwl = float(statistics.stdev(hpwls)) if len(hpwls) > 1 else 0.0
 
             mean_congestion = float(statistics.mean(congestions)) if congestions else None
+            median_congestion = float(statistics.median(congestions)) if congestions else None
+            std_congestion = float(statistics.stdev(congestions)) if len(congestions) > 1 else 0.0
             mean_objective = float(statistics.mean(objectives)) if objectives else None
+            median_objective = float(statistics.median(objectives)) if objectives else None
+            std_objective = float(statistics.stdev(objectives)) if len(objectives) > 1 else 0.0
         else:
             mean_hpwl = None
             median_hpwl = None
@@ -586,7 +594,11 @@ def compute_benchmark_summaries(
             max_hpwl = None
             std_hpwl = None
             mean_congestion = None
+            median_congestion = None
+            std_congestion = None
             mean_objective = None
+            median_objective = None
+            std_objective = None
 
         summaries.append(
             BenchmarkSummary(
@@ -603,16 +615,65 @@ def compute_benchmark_summaries(
                 mean_runtime_sec=mean_runtime,
                 median_runtime_sec=median_runtime,
                 mean_congestion=mean_congestion,
+                median_congestion=median_congestion,
+                std_congestion=std_congestion,
                 mean_objective=mean_objective,
+                median_objective=median_objective,
+                std_objective=std_objective,
             )
         )
 
     return summaries
 
 
+def compute_benchmark_summaries_from_csv(
+    raw_csv_path: Path | str,
+) -> list[BenchmarkSummary]:
+    """Compute aggregated statistical summaries directly from a benchmark_raw_results.csv file."""
+    csv_p = Path(raw_csv_path)
+    if not csv_p.exists():
+        raise FileNotFoundError(f"Raw benchmark results CSV not found at {csv_p}")
+
+    results: list[BenchmarkRunResult] = []
+    with open(csv_p, mode="r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            hpwl_val = float(row["hpwl"]) if row.get("hpwl") else None
+            cong_val = float(row["congestion"]) if row.get("congestion") else None
+            obj_val = float(row["objective"]) if row.get("objective") else None
+            eval_t = float(row["eval_time_sec"]) if row.get("eval_time_sec") else None
+            train_t = float(row["train_time_sec"]) if row.get("train_time_sec") else None
+            train_steps = int(row["train_timesteps"]) if row.get("train_timesteps") else None
+
+            results.append(
+                BenchmarkRunResult(
+                    algorithm=row["algorithm"],
+                    config={},
+                    netlist_id=row["netlist_id"],
+                    grid_w=int(row["grid_w"]),
+                    grid_h=int(row["grid_h"]),
+                    seed=int(row["seed"]),
+                    success=row["success"].strip().lower() == "true",
+                    is_legal=row["is_legal"].strip().lower() == "true",
+                    is_complete=row["is_complete"].strip().lower() == "true",
+                    hpwl=hpwl_val,
+                    runtime_sec=float(row.get("runtime_sec", 0.0)),
+                    error=row.get("error") or None,
+                    congestion=cong_val,
+                    objective=obj_val,
+                    eval_time_sec=eval_t,
+                    train_time_sec=train_t,
+                    train_timesteps=train_steps,
+                    checkpoint_path=row.get("checkpoint_path") or None,
+                )
+            )
+
+    return compute_benchmark_summaries(results)
+
+
 def write_benchmark_reports(
     results: list[BenchmarkRunResult],
-    summaries: list[BenchmarkSummary],
+    summaries: list[BenchmarkSummary] | None,
     output_dir: Path | str,
 ) -> None:
     """Synchronously write benchmark raw records and statistical summaries to CSV and JSON."""
@@ -649,10 +710,13 @@ def write_benchmark_reports(
                 r.error or "",
             ])
 
+    # Always compute verified summaries directly from the persisted raw CSV file
+    verified_summaries = compute_benchmark_summaries_from_csv(raw_csv_path)
+
     # Write summary JSON
     summary_json_path = out_path / "benchmark_summary.json"
     with open(summary_json_path, "w", encoding="utf-8") as f:
-        json.dump([s.to_dict() for s in summaries], f, indent=2)
+        json.dump([s.to_dict() for s in verified_summaries], f, indent=2)
 
     # Write summary CSV
     summary_csv_path = out_path / "benchmark_summary.csv"
@@ -661,10 +725,11 @@ def write_benchmark_reports(
         writer.writerow([
             "algorithm", "netlist_id", "total_runs", "success_count", "success_rate",
             "mean_hpwl", "median_hpwl", "min_hpwl", "max_hpwl", "std_hpwl",
-            "mean_congestion", "mean_objective",
+            "mean_congestion", "median_congestion", "std_congestion",
+            "mean_objective", "median_objective", "std_objective",
             "mean_runtime_sec", "median_runtime_sec",
         ])
-        for s in summaries:
+        for s in verified_summaries:
             writer.writerow([
                 s.algorithm, s.netlist_id, s.total_runs, s.success_count, f"{s.success_rate:.2%}",
                 f"{s.mean_hpwl:.4f}" if s.mean_hpwl is not None else "",
@@ -673,7 +738,11 @@ def write_benchmark_reports(
                 f"{s.max_hpwl:.4f}" if s.max_hpwl is not None else "",
                 f"{s.std_hpwl:.4f}" if s.std_hpwl is not None else "",
                 f"{s.mean_congestion:.6f}" if s.mean_congestion is not None else "",
+                f"{s.median_congestion:.6f}" if s.median_congestion is not None else "",
+                f"{s.std_congestion:.6f}" if s.std_congestion is not None else "",
                 f"{s.mean_objective:.4f}" if s.mean_objective is not None else "",
+                f"{s.median_objective:.4f}" if s.median_objective is not None else "",
+                f"{s.std_objective:.4f}" if s.std_objective is not None else "",
                 f"{s.mean_runtime_sec:.6f}", f"{s.median_runtime_sec:.6f}",
             ])
 

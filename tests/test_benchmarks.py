@@ -162,6 +162,95 @@ def test_compute_benchmark_summaries_with_failures() -> None:
     assert s.mean_runtime_sec == pytest.approx(0.02)
 
 
+def test_compute_benchmark_summaries_congestion_and_objective_stats(tmp_path: Path) -> None:
+    """Summaries compute median and standard deviation for congestion and objective, and disk loader matches."""
+    runs = [
+        BenchmarkRunResult(
+            algorithm="sa",
+            config={},
+            netlist_id="exp_b_12_random",
+            grid_w=28,
+            grid_h=28,
+            seed=42,
+            success=True,
+            is_legal=True,
+            is_complete=True,
+            hpwl=100.0,
+            congestion=10.0,
+            objective=110.0,
+            runtime_sec=0.1,
+            eval_time_sec=0.1,
+        ),
+        BenchmarkRunResult(
+            algorithm="sa",
+            config={},
+            netlist_id="exp_b_12_random",
+            grid_w=28,
+            grid_h=28,
+            seed=43,
+            success=True,
+            is_legal=True,
+            is_complete=True,
+            hpwl=120.0,
+            congestion=20.0,
+            objective=140.0,
+            runtime_sec=0.1,
+            eval_time_sec=0.1,
+        ),
+        BenchmarkRunResult(
+            algorithm="sa",
+            config={},
+            netlist_id="exp_b_12_random",
+            grid_w=28,
+            grid_h=28,
+            seed=44,
+            success=True,
+            is_legal=True,
+            is_complete=True,
+            hpwl=140.0,
+            congestion=30.0,
+            objective=170.0,
+            runtime_sec=0.1,
+            eval_time_sec=0.1,
+        ),
+    ]
+
+    summaries = compute_benchmark_summaries(runs)
+    assert len(summaries) == 1
+    s = summaries[0]
+    assert s.algorithm == "sa"
+    assert s.netlist_id == "exp_b_12_random"
+    assert s.total_runs == 3
+    assert s.success_count == 3
+    assert s.mean_congestion == pytest.approx(20.0)
+    assert s.median_congestion == pytest.approx(20.0)
+    assert s.std_congestion == pytest.approx(10.0)
+    assert s.mean_objective == pytest.approx(140.0)
+    assert s.median_objective == pytest.approx(140.0)
+    assert s.std_objective == pytest.approx(30.0)
+
+    # Test writing reports and reading back from CSV
+    write_benchmark_reports(runs, summaries, tmp_path)
+    from src.placement.benchmarks import compute_benchmark_summaries_from_csv
+    from_disk = compute_benchmark_summaries_from_csv(tmp_path / "benchmark_raw_results.csv")
+    assert len(from_disk) == 1
+    d = from_disk[0]
+    assert d.algorithm == "sa"
+    assert d.median_congestion == pytest.approx(20.0)
+    assert d.std_congestion == pytest.approx(10.0)
+    assert d.median_objective == pytest.approx(140.0)
+    assert d.std_objective == pytest.approx(30.0)
+
+    # Check summary CSV header
+    with open(tmp_path / "benchmark_summary.csv", mode="r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        assert "median_congestion" in header
+        assert "std_congestion" in header
+        assert "median_objective" in header
+        assert "std_objective" in header
+
+
 @async_test
 async def test_run_benchmark_suite_output_files(tmp_path: Path) -> None:
     """run_benchmark_suite exports CSV and JSON summaries into output directory."""
