@@ -264,6 +264,7 @@ async def run_experiment_a(
                     algo == "rl"
                     and not res.success
                     and s in rl_checkpoints
+                    and rl_checkpoints[s][2] is not None
                     and getattr(rl_checkpoints[s][2].eval_result, "feasible", False)
                 ):
                     res = ppo_training_result_to_benchmark_run_result(
@@ -348,6 +349,7 @@ async def run_experiment_b(
                     algo == "rl"
                     and not res.success
                     and s in rl_checkpoints
+                    and rl_checkpoints[s][2] is not None
                     and getattr(rl_checkpoints[s][2].eval_result, "feasible", False)
                 ):
                     res = ppo_training_result_to_benchmark_run_result(
@@ -401,9 +403,13 @@ async def run_experiment_d(
 
         print(f"\nPhase 1: Training PPO on {train_netlist_id} (Seeds: {seeds})...")
         for s in seeds:
-            print(f"  Training PPO on {train_netlist_id} (seed={s}, timesteps={rl_timesteps}, reward_scale={reward_scale})...", end="", flush=True)
             ckpt_path = exp_dir / "checkpoints" / f"ppo_exp_d_train_s{s}.zip"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            if ckpt_path.exists():
+                print(f"  Found existing checkpoint: {ckpt_path.name}. Reusing for zero-shot evaluation.")
+                rl_checkpoints[s] = (str(ckpt_path), 0.0, None)
+                continue
+            print(f"  Training PPO on {train_netlist_id} (seed={s}, timesteps={rl_timesteps}, reward_scale={reward_scale})...", end="", flush=True)
             cfg = PPOTrainingConfig(
                 total_timesteps=rl_timesteps,
                 seed=s,
@@ -441,6 +447,7 @@ async def run_experiment_d(
                     and not res.success
                     and s in rl_checkpoints
                     and netlist_id == train_netlist_id
+                    and rl_checkpoints[s][2] is not None
                     and getattr(rl_checkpoints[s][2].eval_result, "feasible", False)
                 ):
                     res = ppo_training_result_to_benchmark_run_result(

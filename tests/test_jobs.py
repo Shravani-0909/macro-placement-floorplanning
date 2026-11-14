@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
@@ -494,5 +495,26 @@ async def test_rl_placement_runner(small_netlist: Netlist) -> None:
     report = validate_placement(small_netlist, placement)
     assert report.is_valid
     assert report.is_complete
+
+
+@async_test
+async def test_default_rl_placement_runner_os_pathlike_support(small_netlist: Netlist, tmp_path: Path) -> None:
+    """default_rl_placement_runner supports string and os.PathLike without NameError on 'os'."""
+    from unittest.mock import patch
+    fake_path = tmp_path / "mock_ckpt.zip"
+
+    with patch("src.algorithms.rl_placement._HAS_GYMNASIUM", True), \
+         patch("src.algorithms.rl_placement._HAS_SB3", True):
+        for mp in [str(fake_path), fake_path]:
+            try:
+                await default_rl_placement_runner(
+                    netlist=small_netlist,
+                    seed=42,
+                    params={"model_path": mp},
+                    progress_cb=lambda p: asyncio.sleep(0),
+                )
+            except Exception as e:
+                assert not isinstance(e, NameError), f"Unexpected NameError: {e}"
+                assert "name 'os' is not defined" not in str(e)
 
 

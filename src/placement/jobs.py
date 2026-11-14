@@ -1,6 +1,7 @@
 """Job orchestration and background task management for placement runs."""
 
 import asyncio
+import os
 import random
 import uuid
 import numpy as np

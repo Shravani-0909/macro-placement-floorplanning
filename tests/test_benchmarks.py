@@ -832,3 +832,25 @@ async def test_run_experiment_d_smoke(tmp_path: Path) -> None:
         assert "exp_d_train_random" in sum_netlists
         assert "exp_d_test_unseen_inst" in sum_netlists
         assert "exp_d_test_unseen_topo" in sum_netlists
+
+
+@async_test
+async def test_execute_single_benchmark_run_rl_model_path_resolution(tmp_path: Path) -> None:
+    """RL runner cleanly handles model_path configuration without NameError on os or PathLike."""
+    from unittest.mock import patch
+    from src.placement.benchmarks import get_generalization_benchmark_suite, execute_single_benchmark_run
+
+    suite = get_generalization_benchmark_suite()
+    netlist = suite["exp_d_test_unseen_inst"]
+    ckpt_file = tmp_path / "fake_checkpoint.zip"
+
+    with patch("src.algorithms.rl_placement._HAS_GYMNASIUM", True), \
+         patch("src.algorithms.rl_placement._HAS_SB3", True):
+        result = await execute_single_benchmark_run(
+            algorithm="rl",
+            netlist_id="exp_d_test_unseen_inst",
+            netlist=netlist,
+            seed=42,
+            config={"model_path": str(ckpt_file)},
+        )
+        assert "name 'os' is not defined" not in (result.error or "")
