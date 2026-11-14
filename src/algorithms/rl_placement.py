@@ -69,7 +69,7 @@ _BaseEnv: Any = gym.Env if gym is not None else object
 
 def compute_connectivity_features(
     netlist: Any,
-    placed_positions: Mapping[int, tuple[int, int]] | Sequence[PlacedMacro] | None = None,
+    placed_positions: Mapping[int, Any] | Sequence[Any] | None = None,
     current_macro_idx: int = 0,
     cached_graph: tuple[dict[int, int], np.ndarray, np.ndarray, float, float] | None = None,
 ) -> np.ndarray:
@@ -126,10 +126,17 @@ def compute_connectivity_features(
     pos_map: dict[int, tuple[int, int]] = {}
     if placed_positions is not None:
         if isinstance(placed_positions, Mapping):
-            pos_map = {int(k): (int(v[0]), int(v[1])) for k, v in placed_positions.items()}
+            for k, v in placed_positions.items():
+                if hasattr(v, "x") and hasattr(v, "y"):
+                    pos_map[int(k)] = (int(v.x), int(v.y))
+                else:
+                    pos_map[int(k)] = (int(v[0]), int(v[1]))
         else:
-            for pm in placed_positions:
-                pos_map[int(pm.macro_id)] = (int(pm.x), int(pm.y))
+            for item in placed_positions:
+                if hasattr(item, "macro_id") and hasattr(item, "x") and hasattr(item, "y"):
+                    pos_map[int(item.macro_id)] = (int(item.x), int(item.y))
+                elif isinstance(item, (tuple, list)) and len(item) >= 3:
+                    pos_map[int(item[0])] = (int(item[1]), int(item[2]))
 
     grid_w = float(canonical_nl.grid_w)
     grid_h = float(canonical_nl.grid_h)

@@ -37,8 +37,8 @@ from src.algorithms.rl_placement import (
     compute_connectivity_features,
     _HAS_TORCH,
 )
-from src.placement.engine import action_to_coord, coord_to_action
-from src.placement.models import Macro, Net, Netlist
+from src.placement.engine import PlacementEngine, action_to_coord, coord_to_action
+from src.placement.models import Macro, Net, Netlist, PlacedMacro
 from src.placement.objective import evaluate_placement
 
 
@@ -495,6 +495,74 @@ def test_compute_connectivity_features_shape_and_range() -> None:
     assert np.isclose(feat_placed[15], 1.0)  # is_placed
     assert np.isclose(feat_placed[16], 0.4)  # x/W
     assert np.isclose(feat_placed[17], 0.6)  # y/H
+
+
+def test_compute_connectivity_features_with_placed_macro_objects() -> None:
+    """compute_connectivity_features cleanly consumes PlacementEngine.placed_macros (PlacedMacro objects)."""
+    macros = (
+        Macro(id=0, w=2, h=3),
+        Macro(id=1, w=4, h=2),
+        Macro(id=2, w=1, h=1),
+    )
+    nets = (
+        Net(id=0, macro_ids=(0, 1), weight=2.0),
+        Net(id=1, macro_ids=(1, 2), weight=1.0),
+    )
+    netlist = Netlist(version="1.0", grid_w=10, grid_h=10, macros=macros, nets=nets)
+
+    engine = PlacementEngine(netlist)
+    engine.place(1, 4, 6)
+
+    # 1. Test using PlacementEngine.placed_macros (dict[int, PlacedMacro])
+    feat_engine = compute_connectivity_features(
+        netlist,
+        engine.placed_macros,
+        current_macro_idx=0,
+    )
+    expected_dim = 4 + 5 + 6 * 3
+    assert feat_engine.shape == (expected_dim,)
+    assert feat_engine.dtype == np.float32
+    assert np.all(feat_engine >= 0.0)
+    assert np.all(feat_engine <= 1.0)
+    # Centroid of placed connected macros (macro 1 center (6, 7)) -> cx=0.6, cy=0.7
+    assert np.isclose(feat_engine[6], 0.6)
+    assert np.isclose(feat_engine[7], 0.7)
+    # Slot features for macro 1 (index 1: base = 15)
+    assert np.isclose(feat_engine[15], 1.0)
+    assert np.isclose(feat_engine[16], 0.4)
+    assert np.isclose(feat_engine[17], 0.6)
+
+    # 2. Test using Placement sequence (list[PlacedMacro])
+    feat_seq = compute_connectivity_features(
+        netlist,
+        engine.get_placement(),
+        current_macro_idx=0,
+    )
+    assert np.array_equal(feat_engine, feat_seq)
+
+    # 3. Test equivalence with legacy tuple coordinates dict
+    feat_tuples = compute_connectivity_features(
+        netlist,
+        {1: (4, 6)},
+        current_macro_idx=0,
+    )
+    assert np.array_equal(feat_engine, feat_tuples)
+
+    # 4. Moving macro in PlacementEngine updates centroid and slots dynamically
+    engine.unplace(1)
+    engine.place(1, 0, 0)
+    feat_moved = compute_connectivity_features(
+        netlist,
+        engine.placed_macros,
+        current_macro_idx=0,
+    )
+    # New center is (0 + 2, 0 + 1) = (2, 1) -> cx=0.2, cy=0.1
+    assert np.isclose(feat_moved[6], 0.2)
+    assert np.isclose(feat_moved[7], 0.1)
+    assert np.isclose(feat_moved[15], 1.0)
+    assert np.isclose(feat_moved[16], 0.0)
+    assert np.isclose(feat_moved[17], 0.0)
+    assert not np.allclose(feat_engine, feat_moved)
 
 
 def test_connectivity_features_different_for_different_topologies() -> None:
