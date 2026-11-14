@@ -601,3 +601,66 @@ async def test_execute_single_benchmark_run_preserves_rl_metadata_on_failure() -
     assert result.train_timesteps == 4096
     assert result.checkpoint_path == "checkpoints/failing.zip"
     assert result.eval_time_sec == pytest.approx(0.03)
+
+
+def test_parse_seeds_list() -> None:
+    """CLI seed parser handles comma-separated, space-separated, and single seed inputs."""
+    import argparse
+    from scripts.run_experiments import parse_seeds_list
+
+    # Comma-separated
+    assert parse_seeds_list(["42,43,44"]) == [42, 43, 44]
+    # Space-separated
+    assert parse_seeds_list(["42", "43", "44"]) == [42, 43, 44]
+    # Single seed
+    assert parse_seeds_list(["42"]) == [42]
+    # Mixed whitespace and comma
+    assert parse_seeds_list([" 42 , 43 ", "44"]) == [42, 43, 44]
+    # Empty or invalid
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_seeds_list([""])
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_seeds_list(["not_a_number"])
+
+
+@async_test
+async def test_multi_seed_independent_execution_and_persistence(tmp_path: Path) -> None:
+    """Multiple seeds execute independently without overwriting results in CSV and JSON."""
+    suite = get_default_benchmark_suite()
+    toy_nl = suite["toy_4"]
+
+    raw, sums = await run_benchmark_suite(
+        netlists={"toy_4": toy_nl},
+        algorithms=["random"],
+        seeds=[42, 43, 44],
+        output_dir=tmp_path,
+    )
+
+    # 1. In-memory results check
+    assert len(raw) == 3
+    result_seeds = [r.seed for r in raw]
+    assert result_seeds == [42, 43, 44]
+    for r in raw:
+        assert r.success is True
+        assert r.is_legal is True
+        assert r.is_complete is True
+        assert r.netlist_id == "toy_4"
+        assert r.algorithm == "random"
+
+    # 2. Summary check
+    assert len(sums) == 1
+    assert sums[0].total_runs == 3
+    assert sums[0].success_count == 3
+
+    # 3. Raw CSV persistence check
+    csv_file = tmp_path / "benchmark_raw_results.csv"
+    assert csv_file.exists()
+    with open(csv_file, mode="r", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+        assert len(reader) == 3
+        csv_seeds = [int(row["seed"]) for row in reader]
+        assert csv_seeds == [42, 43, 44]
+        for row in reader:
+            assert row["algorithm"] == "random"
+            assert row["netlist_id"] == "toy_4"
+            assert row["success"] == "True"

@@ -448,6 +448,22 @@ async def run_experiment_d(
     print(f"\nExperiment D complete. Results written to {exp_dir}")
 
 
+def parse_seeds_list(raw_seeds: Sequence[str | int]) -> list[int]:
+    """Parse comma-separated or space-separated seeds into a list of integers."""
+    parsed: list[int] = []
+    for item in raw_seeds:
+        for part in str(item).split(","):
+            part_str = part.strip()
+            if part_str:
+                try:
+                    parsed.append(int(part_str))
+                except ValueError:
+                    raise argparse.ArgumentTypeError(f"Invalid integer seed: {part_str!r}")
+    if not parsed:
+        raise argparse.ArgumentTypeError("At least one integer seed must be provided.")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run macro placement experiments (A: Scaling, B: Connectivity, D: Budget Tradeoff)."
@@ -476,10 +492,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--seeds",
-        type=int,
+        type=str,
         nargs="+",
-        default=[42, 100, 2026],
-        help="List of random seeds for evaluation.",
+        default=["42", "100", "2026"],
+        help="List of random seeds for evaluation (supports space- or comma-separated, e.g. 42,43,44).",
     )
     parser.add_argument(
         "--sa-iterations",
@@ -506,6 +522,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    seeds = parse_seeds_list(args.seeds)
 
     if args.check_env:
         print_env_status()
@@ -525,7 +542,7 @@ def main() -> None:
         asyncio.run(
             run_experiment_a(
                 out_dir,
-                args.seeds,
+                seeds,
                 sa_iterations=args.sa_iterations,
                 rl_timesteps=args.timesteps,
                 verbose_rl=args.verbose_rl,
@@ -536,7 +553,7 @@ def main() -> None:
         asyncio.run(
             run_experiment_b(
                 out_dir,
-                args.seeds,
+                seeds,
                 sa_iterations=args.sa_iterations,
                 rl_timesteps=args.timesteps,
                 verbose_rl=args.verbose_rl,
@@ -547,7 +564,7 @@ def main() -> None:
         asyncio.run(
             run_experiment_d(
                 out_dir,
-                args.seeds,
+                seeds,
                 verbose_rl=args.verbose_rl,
                 reward_scale=args.reward_scale,
             )
