@@ -32,7 +32,11 @@ needs_sb3 = pytest.mark.skipif(
     reason="sb3-contrib dependency unavailable in host environment",
 )
 
-from src.algorithms.rl_placement import MacroPlacementEnv
+from src.algorithms.rl_placement import (
+    MacroPlacementEnv,
+    compute_connectivity_features,
+    _HAS_TORCH,
+)
 from src.placement.engine import action_to_coord, coord_to_action
 from src.placement.models import Macro, Net, Netlist
 from src.placement.objective import evaluate_placement
@@ -77,8 +81,11 @@ def test_env_construction(simple_netlist: Netlist) -> None:
     assert isinstance(env.observation_space, gym.spaces.Dict)
     assert "grid_occupancy" in env.observation_space.spaces
     assert "macro_features" in env.observation_space.spaces
+    assert "connectivity_features" in env.observation_space.spaces
     assert env.observation_space["grid_occupancy"].shape == (1, 6, 6)
     assert env.observation_space["macro_features"].shape == (2,)
+    # conn_dim: 4 (self) + 5 (aggregate) + 6 * 2 (slots) = 21
+    assert env.observation_space["connectivity_features"].shape == (21,)
 
 
 @needs_gym
@@ -91,8 +98,11 @@ def test_env_reset(simple_netlist: Netlist) -> None:
     assert isinstance(obs, dict)
     assert "grid_occupancy" in obs
     assert "macro_features" in obs
+    assert "connectivity_features" in obs
     assert np.all(obs["grid_occupancy"] == 0.0)
     assert np.array_equal(obs["macro_features"], np.array([2.0, 2.0], dtype=np.float32))
+    assert obs["connectivity_features"].shape == (21,)
+    assert obs["connectivity_features"].dtype == np.float32
 
     # Engine must be completely empty
     assert len(env.engine.placed_macros) == 0
@@ -446,4 +456,167 @@ def test_ppo_training_checkpoint_lifecycle(simple_netlist: Netlist, tmp_path: Pa
     assert eval_res.objective is not None and eval_res.objective > 0.0
     assert len(eval_res.placement) == len(simple_netlist.macros)
 
+
+def test_compute_connectivity_features_shape_and_range() -> None:
+    """compute_connectivity_features returns correctly shaped, bounded float32 array."""
+    macros = (
+        Macro(id=0, w=2, h=3),
+        Macro(id=1, w=4, h=2),
+        Macro(id=2, w=1, h=1),
+    )
+    nets = (
+        Net(id=0, macro_ids=(0, 1), weight=2.0),
+        Net(id=1, macro_ids=(1, 2), weight=1.0),
+    )
+    netlist = Netlist(version="1.0", grid_w=10, grid_h=10, macros=macros, nets=nets)
+
+    # Initial state: no macros placed, current macro is 0
+    feat0 = compute_connectivity_features(netlist, placed_positions={}, current_macro_idx=0)
+    expected_dim = 4 + 5 + 6 * 3  # 27
+    assert feat0.shape == (expected_dim,)
+    assert feat0.dtype == np.float32
+    assert np.all(feat0 >= 0.0)
+    assert np.all(feat0 <= 1.0)
+
+    # Self features: w/W = 2/10 = 0.2, h/H = 3/10 = 0.3, idx/N = 0/3 = 0.0, step/N = 0/3 = 0.0
+    assert np.isclose(feat0[0], 0.2)
+    assert np.isclose(feat0[1], 0.3)
+    assert np.isclose(feat0[2], 0.0)
+    assert np.isclose(feat0[3], 0.0)
+
+    # Macro 1 placed at (4, 6)
+    feat_placed = compute_connectivity_features(netlist, placed_positions={1: (4, 6)}, current_macro_idx=0)
+    # Placed connected count is 1 / 2
+    assert feat_placed[4] > 0.0
+    # Centroid of placed connected macros: center of macro 1 (w=4, h=2) at (4, 6) is (6, 7) -> cx=0.6, cy=0.7
+    assert np.isclose(feat_placed[6], 0.6)
+    assert np.isclose(feat_placed[7], 0.7)
+    # Slot features for macro 1 (index 1: base = 9 + 6 * 1 = 15):
+    assert np.isclose(feat_placed[15], 1.0)  # is_placed
+    assert np.isclose(feat_placed[16], 0.4)  # x/W
+    assert np.isclose(feat_placed[17], 0.6)  # y/H
+
+
+def test_connectivity_features_different_for_different_topologies() -> None:
+    """Topologically distinct netlists produce distinct connectivity feature vectors."""
+    macros = (
+        Macro(id=0, w=2, h=2),
+        Macro(id=1, w=2, h=2),
+        Macro(id=2, w=2, h=2),
+    )
+    # Netlist A: macro 0 connected to macro 1
+    netlist_a = Netlist(
+        version="1.0",
+        grid_w=10,
+        grid_h=10,
+        macros=macros,
+        nets=(Net(id=0, macro_ids=(0, 1), weight=1.0),),
+    )
+    # Netlist B: macro 0 connected to macro 2
+    netlist_b = Netlist(
+        version="1.0",
+        grid_w=10,
+        grid_h=10,
+        macros=macros,
+        nets=(Net(id=0, macro_ids=(0, 2), weight=1.0),),
+    )
+
+    feat_a = compute_connectivity_features(netlist_a, current_macro_idx=0)
+    feat_b = compute_connectivity_features(netlist_b, current_macro_idx=0)
+
+    assert feat_a.shape == feat_b.shape
+    assert not np.allclose(feat_a, feat_b)
+
+
+def test_connectivity_features_change_when_macro_moves() -> None:
+    """When a connected macro's placement changes, connectivity features update dynamically."""
+    macros = (
+        Macro(id=0, w=2, h=2),
+        Macro(id=1, w=2, h=2),
+    )
+    netlist = Netlist(
+        version="1.0",
+        grid_w=20,
+        grid_h=20,
+        macros=macros,
+        nets=(Net(id=0, macro_ids=(0, 1), weight=1.0),),
+    )
+
+    # Position 1: macro 1 at (2, 2)
+    feat_pos1 = compute_connectivity_features(netlist, placed_positions={1: (2, 2)}, current_macro_idx=0)
+    # Position 2: macro 1 at (16, 18)
+    feat_pos2 = compute_connectivity_features(netlist, placed_positions={1: (16, 18)}, current_macro_idx=0)
+
+    assert not np.allclose(feat_pos1, feat_pos2)
+    # Centroid cx, cy should differ significantly (center of 2x2: (3, 3) vs (17, 19))
+    assert feat_pos1[6] != feat_pos2[6]
+    assert feat_pos1[7] != feat_pos2[7]
+    assert np.isclose(feat_pos1[6], 3.0 / 20.0)
+    assert np.isclose(feat_pos2[6], 17.0 / 20.0)
+
+
+def test_reward_scale_and_features_dim_validation() -> None:
+    """PPOTrainingConfig validates reward_scale and features_dim."""
+    from src.algorithms.rl_placement import PPOTrainingConfig
+
+    # Valid config with custom reward_scale and features_dim
+    cfg = PPOTrainingConfig(reward_scale=0.01, features_dim=64)
+    cfg.validate()
+    assert cfg.reward_scale == 0.01
+    assert cfg.features_dim == 64
+
+    # Invalid reward_scale
+    with pytest.raises(ValueError, match="reward_scale"):
+        PPOTrainingConfig(reward_scale=0.0).validate()
+    with pytest.raises(ValueError, match="reward_scale"):
+        PPOTrainingConfig(reward_scale=-0.5).validate()
+
+    # Invalid features_dim
+    with pytest.raises(ValueError, match="features_dim"):
+        PPOTrainingConfig(features_dim=0).validate()
+    with pytest.raises(ValueError, match="features_dim"):
+        PPOTrainingConfig(features_dim=-10).validate()
+
+
+@needs_gym
+def test_env_reward_scaling(simple_netlist: Netlist) -> None:
+    """reward_scale scales step reward proportionally."""
+    env_unscaled = MacroPlacementEnv(netlist=simple_netlist, reward_scale=1.0)
+    env_unscaled.reset()
+    env_unscaled.current_objective = 100.0
+    _, reward_unscaled, _, _, _ = env_unscaled.step(0)
+
+    env_scaled = MacroPlacementEnv(netlist=simple_netlist, reward_scale=0.1)
+    env_scaled.reset()
+    env_scaled.current_objective = 100.0
+    _, reward_scaled, _, _, _ = env_scaled.step(0)
+
+    assert np.isclose(reward_scaled, 0.1 * reward_unscaled)
+
+
+def test_classical_neutrality_preserved(simple_netlist: Netlist) -> None:
+    """Random, Greedy, and Simulated Annealing algorithms remain correct and unaffected."""
+    from src.algorithms.common import random_legal_placement
+    from src.algorithms.greedy import greedy_placement
+    from src.algorithms.simulated_annealing import simulated_annealing
+
+    # 1. Random
+    rand_p = random_legal_placement(simple_netlist, seed=42)
+    assert rand_p is not None
+    assert len(rand_p) == 2
+    rand_eval = evaluate_placement(simple_netlist, rand_p, alpha=1.0, beta=1.0)
+    assert rand_eval.hpwl > 0.0
+    assert rand_eval.objective > 0.0
+
+    # 2. Greedy
+    greedy_res = greedy_placement(simple_netlist, alpha=1.0, beta=1.0)
+    assert greedy_res.success is True
+    assert greedy_res.hpwl is not None and greedy_res.hpwl > 0.0
+    assert greedy_res.objective is not None and greedy_res.objective > 0.0
+
+    # 3. Simulated Annealing
+    sa_res = simulated_annealing(simple_netlist, alpha=1.0, beta=1.0, seed=42, max_iterations=50)
+    assert sa_res.success is True
+    assert sa_res.hpwl is not None and sa_res.hpwl > 0.0
+    assert sa_res.objective is not None and sa_res.objective > 0.0
 

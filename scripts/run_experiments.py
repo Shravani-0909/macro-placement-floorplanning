@@ -114,7 +114,11 @@ def set_seed(seed: int) -> None:
             torch.cuda.manual_seed_all(seed)
 
 
-async def run_smoke_test(output_dir: Path) -> bool:
+async def run_smoke_test(
+    output_dir: Path,
+    verbose_rl: bool = False,
+    reward_scale: float = 1.0,
+) -> bool:
     """Execute rapid end-to-end smoke test for classical solvers and RL."""
     print("\n--- Running Pipeline Smoke Test ---")
     smoke_dir = output_dir / "smoke_test"
@@ -151,7 +155,8 @@ async def run_smoke_test(output_dir: Path) -> bool:
             seed=seed,
             checkpoint_dir=str(ckpt_dir),
             checkpoint_name="smoke_model",
-            verbose=0,
+            verbose=1 if verbose_rl else 0,
+            reward_scale=reward_scale,
         )
         t_res = train_ppo(toy_nl, config=cfg_rl, checkpoint_path=ckpt_file)
         print(f" Trained in {t_res.training_time_s:.2f}s")
@@ -200,6 +205,8 @@ async def run_experiment_a(
     seeds: list[int],
     sa_iterations: int = 1000,
     rl_timesteps: int = 10000,
+    verbose_rl: bool = False,
+    reward_scale: float = 1.0,
 ) -> None:
     """Experiment A: Problem Size Scaling across 10, 20, 30 macros."""
     print("\n" + "=" * 60)
@@ -231,7 +238,8 @@ async def run_experiment_a(
                 cfg = PPOTrainingConfig(
                     total_timesteps=rl_timesteps,
                     seed=s,
-                    verbose=0,
+                    verbose=1 if verbose_rl else 0,
+                    reward_scale=reward_scale,
                 )
                 t_res = train_ppo(netlist, config=cfg, checkpoint_path=ckpt_path)
                 rl_checkpoints[s] = (str(ckpt_path), t_res.training_time_s, t_res)
@@ -281,6 +289,8 @@ async def run_experiment_b(
     sa_iterations: int = 1000,
     rl_timesteps: int = 10000,
     num_macros: int = 12,
+    verbose_rl: bool = False,
+    reward_scale: float = 1.0,
 ) -> None:
     """Experiment B: Connectivity Graph Structure (Random vs Clustered)."""
     print("\n" + "=" * 60)
@@ -292,6 +302,7 @@ async def run_experiment_b(
     suite = get_connectivity_benchmark_suite(num_macros=num_macros, seed=42)
     results: list[BenchmarkRunResult] = []
 
+    # Algorithms to compare
     algos = ["random", "greedy", "sa"]
     if _RL_READY:
         algos.append("rl")
@@ -311,7 +322,8 @@ async def run_experiment_b(
                 cfg = PPOTrainingConfig(
                     total_timesteps=rl_timesteps,
                     seed=s,
-                    verbose=0,
+                    verbose=1 if verbose_rl else 0,
+                    reward_scale=reward_scale,
                 )
                 t_res = train_ppo(netlist, config=cfg, checkpoint_path=ckpt_path)
                 rl_checkpoints[s] = (str(ckpt_path), t_res.training_time_s, t_res)
@@ -360,6 +372,8 @@ async def run_experiment_d(
     seeds: list[int],
     sa_budgets: list[int] | None = None,
     rl_budgets: list[int] | None = None,
+    verbose_rl: bool = False,
+    reward_scale: float = 1.0,
 ) -> None:
     """Experiment D: SA Search Budget vs. RL Training Cost Tradeoff."""
     print("\n" + "=" * 60)
@@ -399,7 +413,12 @@ async def run_experiment_d(
                 set_seed(s)
                 ckpt_path = exp_dir / "checkpoints" / f"ppo_{netlist_id}_t{steps}_s{s}.zip"
                 ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-                cfg_train = PPOTrainingConfig(total_timesteps=steps, seed=s, verbose=0)
+                cfg_train = PPOTrainingConfig(
+                    total_timesteps=steps,
+                    seed=s,
+                    verbose=1 if verbose_rl else 0,
+                    reward_scale=reward_scale,
+                )
                 t_res = train_ppo(netlist, config=cfg_train, checkpoint_path=ckpt_path)
 
                 cfg_eval = {
@@ -474,6 +493,17 @@ def main() -> None:
         default=10000,
         help="Training timesteps for PPO (default: 10000).",
     )
+    parser.add_argument(
+        "--verbose-rl",
+        action="store_true",
+        help="Print verbose RL training metrics.",
+    )
+    parser.add_argument(
+        "--reward-scale",
+        type=float,
+        default=1.0,
+        help="Reward scaling factor for PPO (default: 1.0).",
+    )
 
     args = parser.parse_args()
 
@@ -487,16 +517,41 @@ def main() -> None:
     print_env_status()
 
     if args.smoke or args.experiment == "smoke":
-        asyncio.run(run_smoke_test(out_dir))
+        asyncio.run(run_smoke_test(out_dir, verbose_rl=args.verbose_rl, reward_scale=args.reward_scale))
         return
 
     exp = args.experiment.upper()
     if exp in ("A", "ALL"):
-        asyncio.run(run_experiment_a(out_dir, args.seeds, sa_iterations=args.sa_iterations, rl_timesteps=args.timesteps))
+        asyncio.run(
+            run_experiment_a(
+                out_dir,
+                args.seeds,
+                sa_iterations=args.sa_iterations,
+                rl_timesteps=args.timesteps,
+                verbose_rl=args.verbose_rl,
+                reward_scale=args.reward_scale,
+            )
+        )
     if exp in ("B", "ALL"):
-        asyncio.run(run_experiment_b(out_dir, args.seeds, sa_iterations=args.sa_iterations, rl_timesteps=args.timesteps))
+        asyncio.run(
+            run_experiment_b(
+                out_dir,
+                args.seeds,
+                sa_iterations=args.sa_iterations,
+                rl_timesteps=args.timesteps,
+                verbose_rl=args.verbose_rl,
+                reward_scale=args.reward_scale,
+            )
+        )
     if exp in ("D", "ALL"):
-        asyncio.run(run_experiment_d(out_dir, args.seeds))
+        asyncio.run(
+            run_experiment_d(
+                out_dir,
+                args.seeds,
+                verbose_rl=args.verbose_rl,
+                reward_scale=args.reward_scale,
+            )
+        )
 
 
 if __name__ == "__main__":

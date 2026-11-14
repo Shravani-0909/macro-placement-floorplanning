@@ -4,10 +4,12 @@ from typing import Any
 
 __all__ = [
     "MacroPlacementEnv",
+    "MacroPlacementFeaturesExtractor",
     "PPOTrainingConfig",
     "PPOTrainingResult",
     "PPOEvalResult",
     "compare_baseline",
+    "compute_connectivity_features",
     "evaluate_ppo",
     "rl_solve",
     "train_ppo",
@@ -19,10 +21,12 @@ def __getattr__(name: str) -> Any:
     """Lazy import RL components to avoid requiring Gymnasium for classical algorithms."""
     if name in (
         "MacroPlacementEnv",
+        "MacroPlacementFeaturesExtractor",
         "PPOTrainingConfig",
         "PPOTrainingResult",
         "PPOEvalResult",
         "compare_baseline",
+        "compute_connectivity_features",
         "evaluate_ppo",
         "train_ppo",
         "train_rl_agent",

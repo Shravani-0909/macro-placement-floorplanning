@@ -46,6 +46,18 @@ except ImportError:
     ActionMasker = None  # type: ignore[assignment, misc]
     _HAS_SB3 = False
 
+try:
+    import torch
+    import torch.nn as nn
+    from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+    _HAS_TORCH = True
+except Exception:
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    BaseFeaturesExtractor = object  # type: ignore[assignment, misc]
+    _HAS_TORCH = False
+
 from src.algorithms.common import to_canonical_netlist
 from src.placement.constraints import validate_placement
 from src.placement.engine import PlacementEngine, action_to_coord, coord_to_action
@@ -53,6 +65,210 @@ from src.placement.models import Macro, Netlist, PlacedMacro, Placement
 from src.placement.objective import EvaluationResult, evaluate_placement
 
 _BaseEnv: Any = gym.Env if gym is not None else object
+
+
+def compute_connectivity_features(
+    netlist: Any,
+    placed_positions: Mapping[int, tuple[int, int]] | Sequence[PlacedMacro] | None = None,
+    current_macro_idx: int = 0,
+    cached_graph: tuple[dict[int, int], np.ndarray, np.ndarray, float, float] | None = None,
+) -> np.ndarray:
+    """Compute normalized, fixed-size connectivity and spatial context features for a macro placement step.
+
+    Feature Vector Layout (size: 4 + 5 + 6 * N, where N = len(netlist.macros)):
+    - [0:4] Current Macro Self-Features:
+        0: norm_w = w / grid_w in (0, 1]
+        1: norm_h = h / grid_h in (0, 1]
+        2: norm_id = current_macro_idx / max(1, N - 1) in [0, 1] (deterministic macro identity)
+        3: norm_step = current_macro_idx / max(1, N) in [0, 1) (placement episode progress)
+    - [4:9] Aggregate Connectivity Context:
+        4: norm_placed_connected = (number of placed connected macros) / max(1, N - 1)
+        5: norm_unplaced_connected = (number of unplaced connected macros) / max(1, N - 1)
+        6: norm_centroid_x = connection-weighted X center of placed connected pins / grid_w (0.5 if none)
+        7: norm_centroid_y = connection-weighted Y center of placed connected pins / grid_h (0.5 if none)
+        8: norm_total_weight = total net weight incident to current macro / max_macro_weight
+    - [9 : 9 + 6*N] Per-Macro Slot Features (6 values per macro j in [0, N-1]):
+        base + 0: is_placed = 1.0 if placed, 0.0 otherwise
+        base + 1: norm_x = macro_j_x / grid_w if placed, 0.0 otherwise
+        base + 2: norm_y = macro_j_y / grid_h if placed, 0.0 otherwise
+        base + 3: norm_w = macro_j_w / grid_w
+        base + 4: norm_h = macro_j_h / grid_h
+        base + 5: connection_strength = net_weight(current_macro, macro_j) / max_conn_weight
+
+    All values are continuous, normalized in [0.0, 1.0], with dtype np.float32.
+    """
+    canonical_nl = to_canonical_netlist(netlist)
+    macros = list(canonical_nl.macros)
+    num_macros = len(macros)
+    if num_macros == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    if cached_graph is not None:
+        id_to_idx, adj_matrix, macro_net_weights, max_conn_weight, max_macro_weight = cached_graph
+    else:
+        id_to_idx = {m.id: i for i, m in enumerate(macros)}
+        adj_matrix = np.zeros((num_macros, num_macros), dtype=np.float32)
+        macro_net_weights = np.zeros(num_macros, dtype=np.float32)
+
+        for net in canonical_nl.nets:
+            wt = float(getattr(net, "weight", 1.0))
+            mids = [id_to_idx[mid] for mid in net.macro_ids if mid in id_to_idx]
+            for i_idx in mids:
+                macro_net_weights[i_idx] += wt
+                for j_idx in mids:
+                    if i_idx != j_idx:
+                        adj_matrix[i_idx, j_idx] += wt
+
+        max_conn_weight = max(1.0, float(np.max(adj_matrix)))
+        max_macro_weight = max(1.0, float(np.max(macro_net_weights)))
+
+    # Parse placed positions into dict mapping macro_id -> (x, y)
+    pos_map: dict[int, tuple[int, int]] = {}
+    if placed_positions is not None:
+        if isinstance(placed_positions, Mapping):
+            pos_map = {int(k): (int(v[0]), int(v[1])) for k, v in placed_positions.items()}
+        else:
+            for pm in placed_positions:
+                pos_map[int(pm.macro_id)] = (int(pm.x), int(pm.y))
+
+    grid_w = float(canonical_nl.grid_w)
+    grid_h = float(canonical_nl.grid_h)
+    feat = np.zeros(4 + 5 + 6 * num_macros, dtype=np.float32)
+
+    if 0 <= current_macro_idx < num_macros:
+        curr_m = macros[current_macro_idx]
+
+        # 1. Self features
+        feat[0] = float(curr_m.w) / grid_w
+        feat[1] = float(curr_m.h) / grid_h
+        feat[2] = float(current_macro_idx) / max(1.0, float(num_macros - 1))
+        feat[3] = float(current_macro_idx) / max(1.0, float(num_macros))
+
+        # 2. Aggregate features of connected macros
+        conn_mask = adj_matrix[current_macro_idx] > 0.0
+        conn_indices = np.where(conn_mask)[0]
+
+        placed_conn = [j for j in conn_indices if macros[j].id in pos_map]
+        unplaced_conn = [j for j in conn_indices if macros[j].id not in pos_map]
+
+        denom = max(1.0, float(num_macros - 1))
+        feat[4] = float(len(placed_conn)) / denom
+        feat[5] = float(len(unplaced_conn)) / denom
+
+        if placed_conn:
+            tot_w = 0.0
+            sum_x = 0.0
+            sum_y = 0.0
+            for j in placed_conn:
+                mj = macros[j]
+                pos = pos_map[mj.id]
+                cx = float(pos[0]) + float(mj.w) / 2.0
+                cy = float(pos[1]) + float(mj.h) / 2.0
+                w_ij = float(adj_matrix[current_macro_idx, j])
+                sum_x += w_ij * cx
+                sum_y += w_ij * cy
+                tot_w += w_ij
+
+            if tot_w > 0.0:
+                feat[6] = (sum_x / tot_w) / grid_w
+                feat[7] = (sum_y / tot_w) / grid_h
+            else:
+                feat[6] = 0.5
+                feat[7] = 0.5
+        else:
+            feat[6] = 0.5
+            feat[7] = 0.5
+
+        feat[8] = float(macro_net_weights[current_macro_idx]) / float(max_macro_weight)
+
+        # 3. Per-macro slot features
+        offset = 9
+        for j, mj in enumerate(macros):
+            base = offset + j * 6
+            if mj.id in pos_map:
+                feat[base] = 1.0
+                pos = pos_map[mj.id]
+                feat[base + 1] = float(pos[0]) / grid_w
+                feat[base + 2] = float(pos[1]) / grid_h
+            else:
+                feat[base] = 0.0
+                feat[base + 1] = 0.0
+                feat[base + 2] = 0.0
+
+            feat[base + 3] = float(mj.w) / grid_w
+            feat[base + 4] = float(mj.h) / grid_h
+            feat[base + 5] = float(adj_matrix[current_macro_idx, j]) / float(max_conn_weight)
+
+    return feat
+
+
+if _HAS_TORCH and _HAS_SB3:
+
+    class MacroPlacementFeaturesExtractor(BaseFeaturesExtractor):
+        """Custom Multi-Input Features Extractor for MacroPlacementEnv.
+
+        Processes:
+        - 'grid_occupancy' (shape: [B, 1, H, W]) via a 2D spatial Convolutional Neural Network
+          with adaptive pooling to preserve spatial geometry across arbitrary grid resolutions.
+        - 'macro_features' (shape: [B, 2]) and 'connectivity_features' (shape: [B, K]) via an MLP.
+        Combines spatial and graph-connectivity embeddings into a unified feature vector.
+        """
+
+        def __init__(
+            self,
+            observation_space: spaces.Dict,
+            features_dim: int = 128,
+        ) -> None:
+            super().__init__(observation_space, features_dim=features_dim)
+
+            # 1. Spatial CNN for grid occupancy
+            occ_space = observation_space["grid_occupancy"]
+            n_input_channels = occ_space.shape[0]  # 1
+
+            self.cnn = nn.Sequential(
+                nn.Conv2d(n_input_channels, 16, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((4, 4)),
+                nn.Flatten(),
+                nn.Linear(32 * 4 * 4, 64),
+                nn.ReLU(),
+            )
+
+            # 2. MLP for macro dimensions and connectivity features
+            macro_dim = int(np.prod(observation_space["macro_features"].shape))
+            conn_dim = int(np.prod(observation_space["connectivity_features"].shape))
+            vector_in_dim = macro_dim + conn_dim
+
+            self.mlp = nn.Sequential(
+                nn.Linear(vector_in_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+            )
+
+            # 3. Fusion projection layer
+            self.fusion = nn.Sequential(
+                nn.Linear(64 + 64, features_dim),
+                nn.ReLU(),
+            )
+
+        def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
+            grid_occ = observations["grid_occupancy"]
+            macro_feat = torch.flatten(observations["macro_features"], start_dim=1)
+            conn_feat = torch.flatten(observations["connectivity_features"], start_dim=1)
+
+            vector_inputs = torch.cat([macro_feat, conn_feat], dim=1)
+
+            spatial_emb = self.cnn(grid_occ)
+            vector_emb = self.mlp(vector_inputs)
+
+            fused = torch.cat([spatial_emb, vector_emb], dim=1)
+            return self.fusion(fused)
+
+else:
+    MacroPlacementFeaturesExtractor = None  # type: ignore[assignment, misc]
 
 
 class MacroPlacementEnv(_BaseEnv):
@@ -89,6 +305,7 @@ class MacroPlacementEnv(_BaseEnv):
         terminal_bonus: float = 0.0,
         dead_end_penalty: float = 20.0,
         illegal_action_penalty: float = 50.0,
+        reward_scale: float = 1.0,
         **kwargs: Any,
     ) -> None:
         if not _HAS_GYMNASIUM:
@@ -137,6 +354,10 @@ class MacroPlacementEnv(_BaseEnv):
         self.terminal_bonus: float = float(terminal_bonus)
         self.dead_end_penalty: float = float(dead_end_penalty)
         self.illegal_action_penalty: float = float(illegal_action_penalty)
+        self.reward_scale: float = float(reward_scale)
+
+        if self.reward_scale <= 0.0:
+            raise ValueError(f"reward_scale must be a positive number, got {self.reward_scale!r}.")
 
         self.grid_w: int = self.netlist.grid_w
         self.grid_h: int = self.netlist.grid_h
@@ -149,11 +370,31 @@ class MacroPlacementEnv(_BaseEnv):
         # Canonical PlacementEngine instance
         self.engine: PlacementEngine = PlacementEngine(self.netlist)
         self.macros: list[Macro] = list(self.netlist.macros)
+        num_macros = len(self.macros)
+
+        # Precompute static connectivity graph structures for fast observation generation
+        id_to_idx = {m.id: i for i, m in enumerate(self.macros)}
+        adj_matrix = np.zeros((num_macros, num_macros), dtype=np.float32)
+        macro_net_weights = np.zeros(num_macros, dtype=np.float32)
+
+        for net in self.netlist.nets:
+            wt = float(getattr(net, "weight", 1.0))
+            mids = [id_to_idx[mid] for mid in net.macro_ids if mid in id_to_idx]
+            for i_idx in mids:
+                macro_net_weights[i_idx] += wt
+                for j_idx in mids:
+                    if i_idx != j_idx:
+                        adj_matrix[i_idx, j_idx] += wt
+
+        max_conn_weight = max(1.0, float(np.max(adj_matrix))) if num_macros > 0 else 1.0
+        max_macro_weight = max(1.0, float(np.max(macro_net_weights))) if num_macros > 0 else 1.0
+        self._cached_graph = (id_to_idx, adj_matrix, macro_net_weights, max_conn_weight, max_macro_weight)
 
         # Action space: discrete coordinates [0, grid_w * grid_h - 1]
         self.action_space = spaces.Discrete(self.grid_w * self.grid_h)
 
-        # Observation space: 2D occupancy grid + current macro dimensions
+        # Observation space: 2D occupancy grid + current macro dimensions + rich connectivity context
+        conn_dim = 4 + 5 + 6 * num_macros
         self.observation_space = spaces.Dict(
             {
                 "grid_occupancy": spaces.Box(
@@ -166,6 +407,12 @@ class MacroPlacementEnv(_BaseEnv):
                     low=0.0,
                     high=float(max(self.grid_w, self.grid_h)),
                     shape=(2,),
+                    dtype=np.float32,
+                ),
+                "connectivity_features": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(conn_dim,),
                     dtype=np.float32,
                 ),
             }
@@ -205,9 +452,17 @@ class MacroPlacementEnv(_BaseEnv):
         else:
             features = np.zeros(2, dtype=np.float32)
 
+        conn_features = compute_connectivity_features(
+            self.netlist,
+            self.engine.placed_macros,
+            self.current_macro_idx,
+            cached_graph=self._cached_graph,
+        )
+
         return {
             "grid_occupancy": occupancy,
             "macro_features": features,
+            "connectivity_features": conn_features,
         }
 
     def action_masks(self) -> np.ndarray:
@@ -281,7 +536,7 @@ class MacroPlacementEnv(_BaseEnv):
         # Check legality against PlacementEngine
         if not self.engine.is_legal(curr.id, x, y):
             obs = self._get_obs()
-            reward = -self.illegal_action_penalty
+            reward = - (self.illegal_action_penalty / self.reward_scale)
             terminated = True
             truncated = False
             info = {
@@ -306,8 +561,9 @@ class MacroPlacementEnv(_BaseEnv):
         )
         new_objective = float(eval_res.objective)
 
-        # Objective-aligned reward: improvement in objective yields positive reward
-        reward = float(self.current_objective - new_objective)
+        # Objective-aligned reward: improvement in objective yields positive reward, scaled deterministically
+        raw_reward = float(self.current_objective - new_objective)
+        reward = raw_reward / self.reward_scale
         self.current_objective = new_objective
 
         is_complete = self.engine.is_complete()
@@ -315,14 +571,14 @@ class MacroPlacementEnv(_BaseEnv):
         truncated = False
 
         if terminated:
-            reward += self.terminal_bonus
+            reward += (self.terminal_bonus / self.reward_scale)
         else:
             # Check if next macro has legal moves
             next_macro = self.macros[self.current_macro_idx]
             next_mask = self.engine.compute_action_mask(next_macro.id, flatten=True)
             if not np.any(next_mask):
                 truncated = True
-                reward -= self.dead_end_penalty
+                reward -= (self.dead_end_penalty / self.reward_scale)
 
         info = {
             "placed_count": len(self.engine.placed_macros),
@@ -346,6 +602,7 @@ def train_rl_agent(
     total_timesteps: int = 10000,
     save_path: str = "ppo_macro_placement.zip",
     verbose: int = 1,
+    features_dim: int = 128,
 ) -> Any:
     """Wrap environment with ActionMasker, train MaskablePPO, and save checkpoint.
 
@@ -354,6 +611,7 @@ def train_rl_agent(
         total_timesteps: Total training timesteps.
         save_path: Output file path for model checkpoint.
         verbose: Verbosity level for training output.
+        features_dim: Output dimension of custom feature extractor.
 
     Returns:
         Trained MaskablePPO agent.
@@ -366,6 +624,14 @@ def train_rl_agent(
 
     wrapped_env = ActionMasker(env, mask_fn)
 
+    policy_kwargs = None
+    if MacroPlacementFeaturesExtractor is not None:
+        policy_kwargs = {
+            "features_extractor_class": MacroPlacementFeaturesExtractor,
+            "features_extractor_kwargs": {"features_dim": features_dim},
+            "net_arch": dict(pi=[64, 64], vf=[64, 64]),
+        }
+
     model = MaskablePPO(
         policy="MultiInputPolicy",
         env=wrapped_env,
@@ -374,6 +640,7 @@ def train_rl_agent(
         learning_rate=3e-4,
         batch_size=64,
         n_steps=128,
+        policy_kwargs=policy_kwargs,
     )
 
     model.learn(total_timesteps=total_timesteps)
@@ -407,6 +674,8 @@ class PPOTrainingConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_name: str = "ppo_macro_placement.zip"
     verbose: int = 0
+    reward_scale: float = 1.0
+    features_dim: int = 128
 
     def validate(self) -> None:
         """Validate configuration settings and hyperparameter ranges."""
@@ -488,6 +757,20 @@ class PPOTrainingConfig:
 
         if not self.checkpoint_name or not isinstance(self.checkpoint_name, str):
             raise ValueError(f"checkpoint_name must be a non-empty string, got {self.checkpoint_name!r}.")
+
+        if (
+            isinstance(self.reward_scale, bool)
+            or not isinstance(self.reward_scale, (int, float, np.floating))
+            or self.reward_scale <= 0.0
+        ):
+            raise ValueError(f"reward_scale must be a positive number, got {self.reward_scale!r}.")
+
+        if (
+            isinstance(self.features_dim, bool)
+            or not isinstance(self.features_dim, (int, np.integer))
+            or self.features_dim <= 0
+        ):
+            raise ValueError(f"features_dim must be a positive integer, got {self.features_dim!r}.")
 
 
 @dataclass(frozen=True)
@@ -599,8 +882,17 @@ def train_ppo(
         terminal_bonus=cfg.terminal_bonus,
         dead_end_penalty=cfg.dead_end_penalty,
         illegal_action_penalty=cfg.illegal_action_penalty,
+        reward_scale=cfg.reward_scale,
     )
     wrapped_env = ActionMasker(train_env, mask_fn)
+
+    policy_kwargs = None
+    if MacroPlacementFeaturesExtractor is not None:
+        policy_kwargs = {
+            "features_extractor_class": MacroPlacementFeaturesExtractor,
+            "features_extractor_kwargs": {"features_dim": cfg.features_dim},
+            "net_arch": dict(pi=[64, 64], vf=[64, 64]),
+        }
 
     model = MaskablePPO(
         policy="MultiInputPolicy",
@@ -614,6 +906,7 @@ def train_ppo(
         ent_coef=cfg.ent_coef,
         seed=seed,
         verbose=cfg.verbose,
+        policy_kwargs=policy_kwargs,
     )
 
     t0 = time.perf_counter()
