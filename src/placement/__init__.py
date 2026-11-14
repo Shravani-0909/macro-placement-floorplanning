@@ -7,6 +7,7 @@ from .benchmarks import (
     get_connectivity_benchmark_suite,
     get_default_benchmark_suite,
     get_scaling_benchmark_suite,
+    ppo_training_result_to_benchmark_run_result,
     run_benchmark_suite,
 )
 from .constraints import (
@@ -84,6 +85,7 @@ __all__ = [
     "is_within_boundary",
     "macros_overlap",
     "placement_to_dict",
+    "ppo_training_result_to_benchmark_run_result",
     "register_algorithm",
     "run_benchmark_suite",
     "validate_macro_boundary",

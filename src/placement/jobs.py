@@ -259,14 +259,18 @@ async def default_rl_placement_runner(
     model_path = params.get("model_path", None)
     deterministic = bool(params.get("deterministic", True))
 
-    model = None
-    if model_path and _HAS_SB3:
-        import os
-        from sb3_contrib import MaskablePPO
+    model = params.get("model", None)
+    model_path = params.get("model_path", None)
+    if model is None and model_path is not None and _HAS_SB3:
+        if not isinstance(model_path, (str, bytes, os.PathLike)):
+            model = model_path
+        else:
+            from pathlib import Path
+            from sb3_contrib import MaskablePPO
 
-        m_str = str(model_path)
-        if os.path.exists(m_str) or os.path.exists(f"{m_str}.zip"):
-            model = MaskablePPO.load(m_str)
+            m_path = Path(model_path)
+            if m_path.exists() or Path(f"{model_path}.zip").exists():
+                model = MaskablePPO.load(str(m_path))
 
     env = MacroPlacementEnv(netlist=netlist, alpha=alpha, beta=beta)
     obs, _info = env.reset(seed=seed)

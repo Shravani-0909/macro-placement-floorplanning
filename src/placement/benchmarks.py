@@ -360,6 +360,67 @@ def get_connectivity_benchmark_suite(
     }
 
 
+def ppo_training_result_to_benchmark_run_result(
+    training_result: Any,
+    netlist: Netlist,
+    netlist_id: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> BenchmarkRunResult:
+    """Convert a PPOTrainingResult or PPOEvalResult into a canonical BenchmarkRunResult."""
+    cfg = dict(config or {})
+
+    # Extract eval_result if PPOTrainingResult is passed, else assume eval_result directly
+    eval_res = getattr(training_result, "eval_result", training_result)
+    target_netlist_id = netlist_id or getattr(training_result, "netlist_id", getattr(netlist, "version", "custom"))
+
+    train_time_sec = getattr(training_result, "training_time_s", cfg.get("train_time_sec", None))
+    if train_time_sec is not None:
+        train_time_sec = float(train_time_sec)
+
+    train_timesteps = getattr(training_result, "total_timesteps", cfg.get("train_timesteps", None))
+    if train_timesteps is not None:
+        train_timesteps = int(train_timesteps)
+
+    checkpoint_path = getattr(training_result, "checkpoint_path", cfg.get("checkpoint_path", None))
+    if checkpoint_path is not None:
+        checkpoint_path = str(checkpoint_path)
+
+    eval_time_sec = getattr(eval_res, "runtime_sec", cfg.get("eval_time_sec", None))
+    if eval_time_sec is not None:
+        eval_time_sec = float(eval_time_sec)
+    else:
+        eval_time_sec = 0.0
+
+    feasible = bool(getattr(eval_res, "feasible", False))
+    hpwl = getattr(eval_res, "hpwl", None)
+    congestion = getattr(eval_res, "congestion", None)
+    objective = getattr(eval_res, "objective", None)
+    error = getattr(eval_res, "error", None) if not feasible else None
+    if not feasible and error is None:
+        error = "RL placement was infeasible or reached dead end."
+
+    return BenchmarkRunResult(
+        algorithm=getattr(eval_res, "algorithm", "rl"),
+        config=cfg,
+        netlist_id=str(target_netlist_id),
+        grid_w=netlist.grid_w,
+        grid_h=netlist.grid_h,
+        seed=int(getattr(eval_res, "seed", cfg.get("seed", 42))),
+        success=feasible,
+        is_legal=feasible,
+        is_complete=feasible,
+        hpwl=float(hpwl) if hpwl is not None else None,
+        runtime_sec=eval_time_sec,
+        error=error,
+        congestion=float(congestion) if congestion is not None else None,
+        objective=float(objective) if objective is not None else None,
+        eval_time_sec=eval_time_sec,
+        train_time_sec=train_time_sec,
+        train_timesteps=train_timesteps,
+        checkpoint_path=checkpoint_path,
+    )
+
+
 async def execute_single_benchmark_run(
     algorithm: str,
     netlist_id: str,
@@ -369,6 +430,11 @@ async def execute_single_benchmark_run(
 ) -> BenchmarkRunResult:
     """Execute a single deterministic algorithm run and evaluate placement legality and HPWL."""
     cfg = config or {}
+    eval_time_sec_cfg = float(cfg["eval_time_sec"]) if "eval_time_sec" in cfg and cfg["eval_time_sec"] is not None else None
+    train_time_sec = float(cfg["train_time_sec"]) if "train_time_sec" in cfg and cfg["train_time_sec"] is not None else None
+    train_timesteps = int(cfg["train_timesteps"]) if "train_timesteps" in cfg and cfg["train_timesteps"] is not None else None
+    checkpoint_path = str(cfg["checkpoint_path"]) if "checkpoint_path" in cfg and cfg["checkpoint_path"] is not None else None
+
     runner = ALGORITHM_REGISTRY.get(algorithm)
 
     if runner is None:
@@ -385,6 +451,10 @@ async def execute_single_benchmark_run(
             hpwl=None,
             runtime_sec=0.0,
             error=f"Algorithm '{algorithm}' is not registered in ALGORITHM_REGISTRY.",
+            eval_time_sec=eval_time_sec_cfg or 0.0,
+            train_time_sec=train_time_sec,
+            train_timesteps=train_timesteps,
+            checkpoint_path=checkpoint_path,
         )
 
     # Dummy callback for progress
@@ -395,6 +465,7 @@ async def execute_single_benchmark_run(
     try:
         placement = await runner(netlist, seed, cfg, noop_progress)
         elapsed = time.perf_counter() - start_time
+        eval_time_sec = eval_time_sec_cfg if eval_time_sec_cfg is not None else elapsed
 
         report = validate_placement(netlist, placement)
         if not report.is_valid or not report.is_complete:
@@ -411,6 +482,10 @@ async def execute_single_benchmark_run(
                 hpwl=None,
                 runtime_sec=elapsed,
                 error=f"Illegal or incomplete placement: {list(report.errors)}",
+                eval_time_sec=eval_time_sec,
+                train_time_sec=train_time_sec,
+                train_timesteps=train_timesteps,
+                checkpoint_path=checkpoint_path,
             )
 
         alpha = float(cfg.get("alpha", 1.0))
@@ -419,17 +494,6 @@ async def execute_single_benchmark_run(
         hpwl = eval_res.hpwl
         congestion = eval_res.congestion
         objective = eval_res.objective
-
-        eval_time_sec = float(cfg.get("eval_time_sec", elapsed))
-        train_time_sec = cfg.get("train_time_sec", None)
-        if train_time_sec is not None:
-            train_time_sec = float(train_time_sec)
-        train_timesteps = cfg.get("train_timesteps", None)
-        if train_timesteps is not None:
-            train_timesteps = int(train_timesteps)
-        checkpoint_path = cfg.get("checkpoint_path", None)
-        if checkpoint_path is not None:
-            checkpoint_path = str(checkpoint_path)
 
         return BenchmarkRunResult(
             algorithm=algorithm,
@@ -454,6 +518,7 @@ async def execute_single_benchmark_run(
 
     except Exception as exc:  # noqa: BLE001
         elapsed = time.perf_counter() - start_time
+        eval_time_sec = eval_time_sec_cfg if eval_time_sec_cfg is not None else elapsed
         return BenchmarkRunResult(
             algorithm=algorithm,
             config=cfg,
@@ -467,6 +532,10 @@ async def execute_single_benchmark_run(
             hpwl=None,
             runtime_sec=elapsed,
             error=str(exc),
+            eval_time_sec=eval_time_sec,
+            train_time_sec=train_time_sec,
+            train_timesteps=train_timesteps,
+            checkpoint_path=checkpoint_path,
         )
 
 

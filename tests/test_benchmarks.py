@@ -2,8 +2,11 @@
 
 import asyncio
 import functools
+import csv
+import json
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,7 +20,9 @@ from src.placement.benchmarks import (
     get_connectivity_benchmark_suite,
     get_default_benchmark_suite,
     get_scaling_benchmark_suite,
+    ppo_training_result_to_benchmark_run_result,
     run_benchmark_suite,
+    write_benchmark_reports,
 )
 from src.placement.models import Macro, Net, Netlist
 
@@ -347,3 +352,252 @@ async def test_benchmark_metrics_congestion_and_objective() -> None:
     s = summaries[0]
     assert s.mean_congestion == pytest.approx(result.congestion)
     assert s.mean_objective == pytest.approx(result.objective)
+
+
+def test_ppo_training_result_to_benchmark_run_result_success() -> None:
+    """Verify that a successful PPOTrainingResult maps all 9 metrics into BenchmarkRunResult."""
+    suite = get_default_benchmark_suite()
+    netlist = suite["toy_4"]
+
+    mock_eval = SimpleNamespace(
+        algorithm="rl",
+        feasible=True,
+        objective=23.456,
+        hpwl=23.123,
+        congestion=0.333,
+        runtime_sec=0.045,
+        seed=42,
+    )
+    mock_training = SimpleNamespace(
+        algorithm="rl",
+        netlist_id="toy_4",
+        seed=42,
+        total_timesteps=1000,
+        training_time_s=15.2,
+        checkpoint_path="checkpoints/ppo_toy_4.zip",
+        eval_result=mock_eval,
+    )
+
+    result = ppo_training_result_to_benchmark_run_result(
+        mock_training,
+        netlist,
+        netlist_id="toy_4",
+    )
+
+    assert result.algorithm == "rl"
+    assert result.netlist_id == "toy_4"
+    assert result.grid_w == 15
+    assert result.grid_h == 15
+    assert result.seed == 42
+    assert result.success is True
+    assert result.is_legal is True
+    assert result.is_complete is True
+    assert result.hpwl == pytest.approx(23.123)
+    assert result.congestion == pytest.approx(0.333)
+    assert result.objective == pytest.approx(23.456)
+    assert result.eval_time_sec == pytest.approx(0.045)
+    assert result.runtime_sec == pytest.approx(0.045)
+    assert result.train_time_sec == pytest.approx(15.2)
+    assert result.train_timesteps == 1000
+    assert result.checkpoint_path == "checkpoints/ppo_toy_4.zip"
+    assert result.error is None
+
+
+def test_ppo_training_result_to_benchmark_run_result_failure() -> None:
+    """Verify that an infeasible/dead-end PPO result preserves metrics and records failure."""
+    suite = get_default_benchmark_suite()
+    netlist = suite["toy_4"]
+
+    mock_eval = SimpleNamespace(
+        algorithm="rl",
+        feasible=False,
+        objective=None,
+        hpwl=None,
+        congestion=None,
+        runtime_sec=0.012,
+        seed=100,
+    )
+    mock_training = SimpleNamespace(
+        algorithm="rl",
+        netlist_id="toy_4",
+        seed=100,
+        total_timesteps=500,
+        training_time_s=8.5,
+        checkpoint_path="checkpoints/ppo_failed.zip",
+        eval_result=mock_eval,
+    )
+
+    result = ppo_training_result_to_benchmark_run_result(
+        mock_training,
+        netlist,
+        netlist_id="toy_4",
+    )
+
+    assert result.algorithm == "rl"
+    assert result.success is False
+    assert result.is_legal is False
+    assert result.is_complete is False
+    assert result.hpwl is None
+    assert result.congestion is None
+    assert result.objective is None
+    assert result.train_time_sec == pytest.approx(8.5)
+    assert result.train_timesteps == 500
+    assert result.checkpoint_path == "checkpoints/ppo_failed.zip"
+    assert result.eval_time_sec == pytest.approx(0.012)
+    assert "infeasible" in (result.error or "").lower() or "dead end" in (result.error or "").lower()
+
+
+def test_write_benchmark_reports_rl_persistence(tmp_path: Path) -> None:
+    """write_benchmark_reports persists all RL metrics into CSV and JSON artifacts."""
+    rl_run_success = BenchmarkRunResult(
+        algorithm="rl",
+        config={"alpha": 1.0, "beta": 1.0},
+        netlist_id="toy_4",
+        grid_w=15,
+        grid_h=15,
+        seed=42,
+        success=True,
+        is_legal=True,
+        is_complete=True,
+        hpwl=25.5,
+        congestion=0.15,
+        objective=25.65,
+        runtime_sec=0.05,
+        eval_time_sec=0.05,
+        train_time_sec=12.34,
+        train_timesteps=2000,
+        checkpoint_path="checkpoints/model.zip",
+        error=None,
+    )
+    rl_run_failed = BenchmarkRunResult(
+        algorithm="rl",
+        config={"alpha": 1.0, "beta": 1.0},
+        netlist_id="toy_4",
+        grid_w=15,
+        grid_h=15,
+        seed=99,
+        success=False,
+        is_legal=False,
+        is_complete=False,
+        hpwl=None,
+        congestion=None,
+        objective=None,
+        runtime_sec=0.02,
+        eval_time_sec=0.02,
+        train_time_sec=12.34,
+        train_timesteps=2000,
+        checkpoint_path="checkpoints/model.zip",
+        error="RL placement reached a dead end at step 2/4.",
+    )
+    classical_run = BenchmarkRunResult(
+        algorithm="sa",
+        config={},
+        netlist_id="toy_4",
+        grid_w=15,
+        grid_h=15,
+        seed=42,
+        success=True,
+        is_legal=True,
+        is_complete=True,
+        hpwl=30.0,
+        congestion=0.20,
+        objective=30.20,
+        runtime_sec=0.10,
+        eval_time_sec=0.10,
+        train_time_sec=None,
+        train_timesteps=None,
+        checkpoint_path=None,
+        error=None,
+    )
+
+    results = [classical_run, rl_run_success, rl_run_failed]
+    summaries = compute_benchmark_summaries(results)
+    write_benchmark_reports(results, summaries, tmp_path)
+
+    # 1. Validate raw CSV
+    raw_csv = tmp_path / "benchmark_raw_results.csv"
+    assert raw_csv.exists()
+    with open(raw_csv, mode="r", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+        assert len(reader) == 3
+        rl_rows = [row for row in reader if row["algorithm"] == "rl"]
+        assert len(rl_rows) == 2
+
+        # Check successful RL record
+        row_s = rl_rows[0]
+        assert row_s["success"] == "True"
+        assert row_s["is_legal"] == "True"
+        assert row_s["is_complete"] == "True"
+        assert float(row_s["hpwl"]) == pytest.approx(25.5)
+        assert float(row_s["congestion"]) == pytest.approx(0.15)
+        assert float(row_s["objective"]) == pytest.approx(25.65)
+        assert float(row_s["train_time_sec"]) == pytest.approx(12.34)
+        assert int(row_s["train_timesteps"]) == 2000
+        assert row_s["checkpoint_path"] == "checkpoints/model.zip"
+        assert float(row_s["eval_time_sec"]) == pytest.approx(0.05)
+        assert row_s["error"] == ""
+
+        # Check failed RL record
+        row_f = rl_rows[1]
+        assert row_f["success"] == "False"
+        assert row_f["is_legal"] == "False"
+        assert row_f["is_complete"] == "False"
+        assert row_f["hpwl"] == ""
+        assert row_f["congestion"] == ""
+        assert row_f["objective"] == ""
+        assert float(row_f["train_time_sec"]) == pytest.approx(12.34)
+        assert int(row_f["train_timesteps"]) == 2000
+        assert row_f["checkpoint_path"] == "checkpoints/model.zip"
+        assert "dead end" in row_f["error"]
+
+    # 2. Validate raw JSON
+    raw_json = tmp_path / "benchmark_raw_results.json"
+    assert raw_json.exists()
+    with open(raw_json, mode="r", encoding="utf-8") as f:
+        data = json.load(f)
+        assert len(data) == 3
+        rl_data = [d for d in data if d["algorithm"] == "rl"]
+        assert len(rl_data) == 2
+        assert rl_data[0]["success"] is True
+        assert rl_data[0]["train_timesteps"] == 2000
+        assert rl_data[0]["train_time_sec"] == pytest.approx(12.34)
+        assert rl_data[0]["checkpoint_path"] == "checkpoints/model.zip"
+        assert rl_data[1]["success"] is False
+        assert rl_data[1]["train_timesteps"] == 2000
+
+
+@async_test
+async def test_execute_single_benchmark_run_preserves_rl_metadata_on_failure() -> None:
+    """execute_single_benchmark_run retains RL metadata even when the runner fails."""
+    from src.placement.jobs import register_algorithm
+
+    async def failing_runner(netlist, seed, params, progress_cb):
+        raise ValueError("Simulated placement runner failure.")
+
+    register_algorithm("failing_rl_test", failing_runner)
+
+    suite = get_default_benchmark_suite()
+    netlist = suite["toy_4"]
+    cfg = {
+        "train_time_sec": 19.85,
+        "train_timesteps": 4096,
+        "checkpoint_path": "checkpoints/failing.zip",
+        "eval_time_sec": 0.03,
+    }
+
+    result = await execute_single_benchmark_run(
+        algorithm="failing_rl_test",
+        netlist_id="toy_4",
+        netlist=netlist,
+        seed=42,
+        config=cfg,
+    )
+
+    assert result.success is False
+    assert result.is_legal is False
+    assert result.is_complete is False
+    assert result.error == "Simulated placement runner failure."
+    assert result.train_time_sec == pytest.approx(19.85)
+    assert result.train_timesteps == 4096
+    assert result.checkpoint_path == "checkpoints/failing.zip"
+    assert result.eval_time_sec == pytest.approx(0.03)
