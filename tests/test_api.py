@@ -61,7 +61,10 @@ async def asgi_request(
             response_body.extend(message.get("body", b""))
 
     await app(scope, receive, send)
-    parsed = json.loads(response_body.decode("utf-8")) if response_body else {}
+    try:
+        parsed = json.loads(response_body.decode("utf-8")) if response_body else {}
+    except Exception:
+        parsed = {"raw": response_body.decode("utf-8", errors="replace")}
     return status_code, parsed
 
 
@@ -424,3 +427,140 @@ async def test_completed_job_has_congestion_and_objective(valid_netlist_payload:
     assert rudy_status == 200
     assert rudy_body["grid_w"] == 20
     assert rudy_body["congestion_score"] == job["current_congestion"]
+
+
+# ---------------------------------------------------------------------------
+# Phase E Tests: Experiments & Reports Endpoints
+# ---------------------------------------------------------------------------
+
+
+@async_test
+async def test_experiments_index_endpoint() -> None:
+    """GET /api/experiments returns summary for Experiments A, B, and D with archival metadata."""
+    status_code, body = await asgi_request("GET", "/api/experiments")
+    assert status_code == 200
+    assert "experiments" in body
+    assert "research_summary" in body
+
+    exp_ids = {e["id"] for e in body["experiments"]}
+    assert exp_ids == {"a", "b", "d"}
+
+    exp_map = {e["id"]: e for e in body["experiments"]}
+    assert exp_map["a"]["is_archival"] is False
+    assert exp_map["b"]["is_archival"] is True
+    assert exp_map["b"]["source_type"] == "verified_archival_reconstruction"
+    assert exp_map["d"]["is_archival"] is True
+    assert exp_map["d"]["source_type"] == "verified_archival_reconstruction"
+
+    takeaways = body["research_summary"]["key_takeaways"]
+    assert len(takeaways) >= 4
+    assert any("Greedy" in t for t in takeaways)
+    assert any("RL" in t for t in takeaways)
+
+
+@async_test
+async def test_experiment_a_endpoint() -> None:
+    """GET /api/experiments/a returns canonical scaling data and figures."""
+    status_code, body = await asgi_request("GET", "/api/experiments/a")
+    assert status_code == 200
+    assert body["experiment"] == "A"
+    assert len(body["rows"]) == 3
+
+    row_map = {r["benchmark"]: r for r in body["rows"]}
+    assert "dense_10" in row_map
+    assert "scaling_20" in row_map
+    assert "scaling_30" in row_map
+
+    # scaling_30 must be 48x48
+    assert row_map["scaling_30"]["grid_w"] == 48
+    assert row_map["scaling_30"]["grid_h"] == 48
+
+    # Greedy has lowest objective on all
+    for r in body["rows"]:
+        assert r["best_algorithm"] == "Greedy"
+        assert r["greedy_obj"] < r["random_obj"]
+
+    # RL Improvement vs Random is positive (canonical improvement)
+    assert row_map["dense_10"]["rl_improvement_pct"] == pytest.approx(28.95, abs=0.05)
+    assert row_map["scaling_20"]["rl_improvement_pct"] == pytest.approx(8.98, abs=0.05)
+    assert row_map["scaling_30"]["rl_improvement_pct"] == pytest.approx(11.40, abs=0.05)
+
+
+@async_test
+async def test_experiment_b_endpoint() -> None:
+    """GET /api/experiments/b returns connectivity sensitivities and archival label."""
+    status_code, body = await asgi_request("GET", "/api/experiments/b")
+    assert status_code == 200
+    assert body["experiment"] == "B"
+    assert body["is_archival"] is True
+    assert "Verified archival reconstruction" in body["provenance_label"]
+    assert len(body["topologies"]) == 2
+    assert len(body["sensitivities"]) == 4
+
+    sens_map = {s["algorithm"]: s for s in body["sensitivities"]}
+    assert sens_map["Simulated Annealing"]["pct_change"] == pytest.approx(-29.34, abs=0.05)
+    assert sens_map["Greedy"]["pct_change"] == pytest.approx(-15.79, abs=0.05)
+    assert sens_map["RL (Maskable PPO)"]["pct_change"] == pytest.approx(-15.15, abs=0.05)
+
+
+@async_test
+async def test_experiment_d_canonical_values() -> None:
+    """GET /api/experiments/d returns canonical verified means, gaps, and rankings."""
+    status_code, body = await asgi_request("GET", "/api/experiments/d")
+    assert status_code == 200
+    assert body["experiment"] == "D"
+    assert body["is_archival"] is True
+    assert "12 macros, 28×28" in body["controlled_setup"]
+
+    cond_map = {c["condition"]: c for c in body["conditions"]}
+    train = cond_map["training"]
+    unseen_inst = cond_map["unseen_instance"]
+    unseen_topo = cond_map["unseen_topology"]
+
+    # Canonical means
+    assert train["random_obj"] == pytest.approx(513.57, abs=0.05)
+    assert train["greedy_obj"] == pytest.approx(225.48, abs=0.05)
+    assert train["sa_obj"] == pytest.approx(305.04, abs=0.05)
+    assert train["rl_obj"] == pytest.approx(335.42, abs=0.05)
+    assert train["ranking"] == "Greedy < SA < RL < Random"
+
+    assert unseen_inst["random_obj"] == pytest.approx(535.44, abs=0.05)
+    assert unseen_inst["greedy_obj"] == pytest.approx(305.76, abs=0.05)
+    assert unseen_inst["sa_obj"] == pytest.approx(348.53, abs=0.05)
+    assert unseen_inst["rl_obj"] == pytest.approx(441.64, abs=0.05)
+    assert unseen_inst["ranking"] == "Greedy < SA < RL < Random"
+
+    assert unseen_topo["random_obj"] == pytest.approx(568.86, abs=0.05)
+    assert unseen_topo["greedy_obj"] == pytest.approx(282.70, abs=0.05)
+    assert unseen_topo["sa_obj"] == pytest.approx(280.87, abs=0.05)
+    assert unseen_topo["rl_obj"] == pytest.approx(460.45, abs=0.05)
+    # Correct ranking: SA < Greedy < RL < Random
+    assert unseen_topo["ranking"] == "SA < Greedy < RL < Random"
+    assert unseen_topo["best_algorithm"] == "Simulated Annealing"
+
+    # Generalization gaps
+    gap_map = {g["algorithm"]: g for g in body["gaps"]}
+    rl_gap = gap_map["RL (Maskable PPO)"]
+    assert rl_gap["inst_delta"] == pytest.approx(106.22, abs=0.1)
+    assert rl_gap["inst_gap_pct"] == pytest.approx(31.67, abs=0.1)
+    assert rl_gap["topo_delta"] == pytest.approx(125.04, abs=0.1)
+    assert rl_gap["topo_gap_pct"] == pytest.approx(37.28, abs=0.1)
+
+
+@async_test
+async def test_reports_endpoints() -> None:
+    """GET /api/reports and download endpoints serve report artifacts and handle missing files."""
+    status_code, body = await asgi_request("GET", "/api/reports")
+    assert status_code == 200
+    assert body["html_available"] is True
+    assert body["html_url"] is not None
+    assert body["pdf_status"] in ("Available", "Not generated")
+    assert body["figures_count"] >= 4
+
+    # Download existing HTML report
+    dl_status, _ = await asgi_request("GET", "/api/reports/download/macro_placement_report.html")
+    assert dl_status == 200
+
+    # Non-existent report returns 404
+    missing_status, _ = await asgi_request("GET", "/api/reports/download/does_not_exist.html")
+    assert missing_status == 404

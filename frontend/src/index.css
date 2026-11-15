@@ -1,51 +1,62 @@
 :root {
-  --bg: #f3f5f9;
-  --panel: #ffffff;
-  --panel-2: #f7f8fb;
-  --border: #dde2ec;
-  --text: #172033;
-  --muted: #627089;
-  --accent: #3b5bdb;
-  --accent-soft: #e7ecff;
-  --accent-2: #0c8f6f;
-  --ok: #12805c;
-  --ok-bg: #e2f6ee;
-  --warn: #a15c00;
-  --warn-bg: #fff3dc;
-  --err: #c23030;
-  --err-bg: #fde9e9;
-  --chip: #fbfcfe;
-  --grid-minor: #e9edf4;
-  --grid-major: #cdd5e3;
-  --shadow: 0 1px 2px rgba(20, 30, 60, 0.06), 0 4px 14px rgba(20, 30, 60, 0.05);
-  color-scheme: light dark;
-  font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  font-size: 14px;
-  line-height: 1.45;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1220;
-    --panel: #151c2f;
-    --panel-2: #1a2238;
-    --border: #28324d;
-    --text: #e6eaf5;
-    --muted: #93a0bd;
-    --accent: #7c93ff;
-    --accent-soft: #232d57;
-    --accent-2: #3ccfa3;
-    --ok: #4cd6a4;
-    --ok-bg: #11332a;
-    --warn: #ffc15a;
-    --warn-bg: #3a2c10;
-    --err: #ff7b7b;
-    --err-bg: #3b1818;
-    --chip: #10172a;
-    --grid-minor: #1b2440;
-    --grid-major: #2e3a5e;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  }
+  /* Professional Semiconductor Engineering Workstation Color System */
+  --bg: #0B1120;             /* Main deep blue-charcoal background */
+  --bg-subtle: #0E1526;      /* Slightly darker substrate */
+  --panel: #111827;          /* Primary panels */
+  --panel-2: #172033;        /* Secondary panels / cards */
+  --panel-3: #1C2738;        /* Elevated surfaces */
+  --panel-hover: #222F43;    /* Muted panel hover */
+  --border: #293548;         /* Subtle blue-gray borders */
+  --border-subtle: #1F2A3B;  /* Deeper structural borders */
+  --border-focus: #4F8CC9;   /* Controlled focus border */
+  
+  /* Typography Colors */
+  --text: #E5E7EB;           /* Primary text */
+  --text-secondary: #9CA3AF; /* Secondary text */
+  --muted: #6B7280;          /* Muted text */
+  --muted-dark: #4B5563;     /* Subtle ticks and labels */
+  
+  /* Primary Restrained Accent */
+  --accent: #4F8CC9;         /* Single restrained engineering blue */
+  --accent-hover: #6FA8DC;   /* Accent hover */
+  --accent-soft: rgba(79, 140, 201, 0.12); /* Subtle fill */
+  --accent-cyan: #5EA1C9;    /* Secondary technical highlight */
+  
+  /* Semantic Status (No neon glow) */
+  --ok: #5FAF83;             /* Muted green */
+  --ok-bg: rgba(95, 175, 131, 0.12);
+  --ok-border: rgba(95, 175, 131, 0.3);
+  --warn: #C89B4A;           /* Muted amber */
+  --warn-bg: rgba(200, 155, 74, 0.12);
+  --warn-border: rgba(200, 155, 74, 0.3);
+  --err: #C96B6B;            /* Muted red */
+  --err-bg: rgba(201, 107, 107, 0.12);
+  --err-border: rgba(201, 107, 107, 0.3);
+  
+  /* Floorplan / CAD Die Substrate Tokens */
+  --chip: #070D1A;           /* Die substrate */
+  --chip-border: #293548;    /* Die border */
+  --grid-minor: #141D2D;     /* Minor grid line */
+  --grid-major: #243044;     /* Major grid line */
+  --ruler-bg: #0B1120;       /* Ruler background */
+  --ruler-text: #6B7280;     /* Ruler coordinates */
+  --macro-stroke: rgba(255, 255, 255, 0.2);
+  --macro-hover-stroke: #6FA8DC;
+  --macro-selected-stroke: #FFFFFF;
+  --net-color: #64748B;      /* Normal net flyline */
+  --net-dim: rgba(100, 116, 139, 0.12);
+  --net-highlight: #8FB4D9;  /* Selected/connected net flyline */
+  
+  /* Restrained Shadows & Radii */
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --radius: 5px;
+  --radius-lg: 6px;
+  
+  color-scheme: dark;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13.5px;
+  line-height: 1.5;
 }
 
 *,
@@ -58,29 +69,39 @@ html,
 body,
 #root {
   margin: 0;
-  min-height: 100%;
-}
-
-body {
+  padding: 0;
+  min-height: 100vh;
   background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-h1,
-h2,
-p {
+h1, h2, h3, h4, p {
   margin: 0;
 }
 
-button,
-input,
-select {
+button, input, select, textarea {
   font: inherit;
   color: inherit;
 }
 
-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.92em;
+code, .mono {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Custom Clean Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }

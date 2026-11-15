@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import './App.css'
+import { ExperimentsView } from './ExperimentsView'
 
 /* ───────────────────────── Types (mirror src/placement/api.py) ───────────────────────── */
 type Status = 'idle' | 'submitting' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+type ViewMode = 'placement' | 'connectivity' | 'congestion'
+type BottomTab = 'convergence' | 'comparison' | 'history' | 'export'
+type ConfigSubTab = 'design' | 'macros' | 'nets'
+
 interface Placed { macro_id: number; x: number; y: number }
 interface Netlist {
   version: string
@@ -63,9 +68,9 @@ const POLL_MS = 200
 const RUN_TIMEOUT_MS = 180_000
 const RL_RE = /^(rl|ppo|maskable_ppo|rl_ppo|reinforcement\w*)$/i
 const ALGS = [
-  { key: 'random', label: 'Random' },
   { key: 'greedy', label: 'Greedy' },
   { key: 'sa', label: 'Simulated Annealing' },
+  { key: 'random', label: 'Random' },
 ]
 const DEFAULT_MACROS: MacroRow[] = [
   { id: '0', w: '6', h: '4' }, { id: '1', w: '4', h: '4' }, { id: '2', w: '5', h: '3' },
@@ -80,8 +85,8 @@ const DEFAULT_NETS: NetRow[] = [
 /* ───────────────────────── Helpers ───────────────────────── */
 const toInt = (s: string) => (s.trim() !== '' && Number.isInteger(Number(s)) ? Number(s) : NaN)
 const toNum = (s: string) => (s.trim() !== '' ? Number(s) : NaN)
-const fmt = (n: number | null | undefined, d = 3) =>
-  n == null || Number.isNaN(n) ? '—' : n.toLocaleString(undefined, { maximumFractionDigits: d })
+const fmt = (n: number | null | undefined, d = 2) =>
+  n == null || Number.isNaN(n) ? '—' : n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })
 const fmtMs = (ms: number | null) => (ms == null ? '—' : ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(2)} s`)
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError'
@@ -120,11 +125,11 @@ async function api<T>(base: string, path: string, init?: RequestInit): Promise<T
     })
   } catch (e) {
     if (isAbort(e)) throw e
-    throw new Error(`Cannot reach the API at ${base}. Is the backend running (uvicorn) and is the URL correct?`)
+    throw new Error(`Cannot reach API at ${base}. Ensure the backend (uvicorn) is running.`)
   }
   const text = await res.text()
   let body: unknown = text
-  try { body = text ? JSON.parse(text) : null } catch { /* keep raw text */ }
+  try { body = text ? JSON.parse(text) : null } catch { /* keep raw */ }
   if (!res.ok) {
     const d = body && typeof body === 'object' ? (body as Record<string, unknown>).detail : body
     throw new Error(`HTTP ${res.status}: ${detailText(d) || res.statusText}`)
@@ -147,7 +152,7 @@ function buildNetlist(gw: string, gh: string, macros: MacroRow[], nets: NetRow[]
     if (seen.has(id)) errors.push(`Macro ID ${id} is duplicated.`)
     seen.add(id)
     if (!(w > 0) || !(h > 0)) return void errors.push(`Macro ${id}: width and height must be positive integers.`)
-    if (W > 0 && H > 0 && (w > W || h > H)) errors.push(`Macro ${id} (${w}×${h}) exceeds the grid (${W}×${H}).`)
+    if (W > 0 && H > 0 && (w > W || h > H)) errors.push(`Macro ${id} (${w}×${h}) exceeds grid boundary (${W}×${H}).`)
     area += w * h
     ms.push({ id, w, h })
   })
@@ -170,7 +175,6 @@ function buildNetlist(gw: string, gh: string, macros: MacroRow[], nets: NetRow[]
   return { netlist: { version: '1.0', grid_w: W, grid_h: H, macros: ms, nets: ns }, errors }
 }
 
-/** Independent client-side sanity check of a returned placement (bounds, overlap, completeness). */
 function checkLegal(nl: Netlist, pl: Placed[]): string[] {
   const issues: string[] = []
   const dims = new Map(nl.macros.map((m) => [m.id, m]))
@@ -178,13 +182,13 @@ function checkLegal(nl: Netlist, pl: Placed[]): string[] {
   for (const p of pl) {
     const m = dims.get(p.macro_id)
     if (!m) { issues.push(`Unknown macro ${p.macro_id}`); continue }
-    if (p.x < 0 || p.y < 0 || p.x + m.w > nl.grid_w || p.y + m.h > nl.grid_h) issues.push(`Macro ${m.id} out of bounds`)
+    if (p.x < 0 || p.y < 0 || p.x + m.w > nl.grid_w || p.y + m.h > nl.grid_h) issues.push(`Macro M${m.id} out of bounds`)
     rects.push({ id: m.id, x: p.x, y: p.y, w: m.w, h: m.h })
   }
   for (let i = 0; i < rects.length; i++)
     for (let j = i + 1; j < rects.length; j++) {
       const a = rects[i], b = rects[j]
-      if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) issues.push(`Macros ${a.id} and ${b.id} overlap`)
+      if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) issues.push(`Macros M${a.id} and M${b.id} overlap`)
     }
   if (rects.length !== nl.macros.length) issues.push(`Placed ${rects.length}/${nl.macros.length} macros`)
   return issues
@@ -205,7 +209,6 @@ function download(name: string, mime: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-/** Submit one run and poll until it finishes. Reports every real server snapshot through patch(). */
 async function runOne(
   base: string, alg: string, nl: Netlist, seed: number, params: Record<string, unknown>,
   signal: AbortSignal, patch: (p: Partial<RunRec>) => void,
@@ -222,7 +225,7 @@ async function runOne(
     for (; ;) {
       await sleep(POLL_MS)
       if (signal.aborted) throw new DOMException('aborted', 'AbortError')
-      if (performance.now() - t0 > RUN_TIMEOUT_MS) throw new Error('Timed out waiting for the run to finish.')
+      if (performance.now() - t0 > RUN_TIMEOUT_MS) throw new Error('Timed out waiting for placement completion.')
       let js: JobStatus
       try {
         js = await api<JobStatus>(base, `/api/placements/${start.run_id}`, { signal })
@@ -252,22 +255,23 @@ async function runOne(
     }
   } catch (e) {
     patch(isAbort(e)
-      ? { status: 'cancelled', error: 'Cancelled in the browser (the backend job may still finish).', elapsedMs: performance.now() - t0 }
+      ? { status: 'cancelled', error: 'Placement cancelled.', elapsedMs: performance.now() - t0 }
       : { status: 'failed', error: errMsg(e), elapsedMs: performance.now() - t0 })
   }
 }
 
 /* ───────────────────────── SVG Floorplan & Heatmap ───────────────────────── */
 function Floorplan({
-  nl, placement, showGrid, showNets, showLabels, showHeatmap, rudy, compact,
+  nl, placement, showGrid, showNets, showLabels, showHeatmap, rudy, compact, selectedMacroId, onSelectMacro,
 }: {
   nl: Netlist; placement: Placed[]; showGrid: boolean; showNets: boolean; showLabels: boolean
   showHeatmap?: boolean; rudy?: RudyData | null; compact?: boolean
+  selectedMacroId?: number | null; onSelectMacro?: (id: number | null) => void
 }) {
   const { grid_w: W, grid_h: H } = nl
-  const p = Math.max(W, H) * 0.075
+  const p = Math.max(W, H) * 0.08
   const fs = p * 0.42
-  const step = [1, 2, 5, 10, 20, 50, 100, 200, 500].find((s) => W / s <= 12 && H / s <= 12) ?? 1000
+  const step = [1, 2, 5, 10, 20, 50, 100, 200, 500].find((s) => W / s <= 14 && H / s <= 14) ?? 1000
   const pos = new Map(placement.map((q) => [q.macro_id, q]))
   const dims = new Map(nl.macros.map((m) => [m.id, m]))
   const center = (id: number) => {
@@ -277,20 +281,42 @@ function Floorplan({
   const ticks = (n: number) => Array.from({ length: Math.floor(n / step) + 1 }, (_, i) => i * step)
   const minor = W * H <= 2500
 
+  // Filter connected nets when a macro is selected
+  const connectedNets = useMemo(() => {
+    if (selectedMacroId == null) return new Set<number>()
+    return new Set(nl.nets.filter((n) => n.macro_ids.includes(selectedMacroId)).map((n) => n.id))
+  }, [nl.nets, selectedMacroId])
+
   return (
-    <svg className="fp-svg" viewBox={`${-p} ${-p} ${W + p * 1.5} ${H + p * 1.5}`} role="img"
-      aria-label={`Floorplan ${W} by ${H} grid with ${placement.length} placed macros`}>
+    <svg
+      className="fp-svg"
+      viewBox={`${-p} ${-p} ${W + p * 1.5} ${H + p * 1.5}`}
+      role="img"
+      aria-label={`Floorplan ${W} by ${H} grid with ${placement.length} placed macros`}
+      onClick={(e) => {
+        if (e.target === e.currentTarget || (e.target as SVGElement).classList.contains('fp-chip')) {
+          onSelectMacro?.(null)
+        }
+      }}
+    >
+      <defs>
+        <pattern id="eda-grid-minor" width="1" height="1" patternUnits="userSpaceOnUse">
+          <path d="M 1 0 L 0 0 0 1" fill="none" stroke="var(--grid-minor)" strokeWidth="0.04" />
+        </pattern>
+      </defs>
+
+      {/* Chip Die Substrate */}
       <rect x={0} y={0} width={W} height={H} className="fp-chip" />
 
-      {/* RUDY Wire Density Heatmap Cells */}
+      {/* RUDY Wire Demand Heatmap */}
       {showHeatmap && rudy && rudy.demand && rudy.demand.map((row, y) =>
         row.map((val, x) => {
           if (val <= 0.001) return null
           const maxD = rudy.max_demand > 0 ? rudy.max_demand : 1.0
           const ratio = Math.min(1.0, val / maxD)
-          // Gradient from transparent blue (220) to orange-red (0)
-          const hueVal = Math.max(0, 220 - ratio * 220)
-          const alpha = 0.2 + ratio * 0.65
+          // Cold blue-cyan (210) to warning amber (45) to hot red (0)
+          const hueVal = Math.max(0, 210 - ratio * 210)
+          const alpha = 0.22 + ratio * 0.65
           return (
             <rect
               key={`rudy-${x}-${y}`}
@@ -298,68 +324,148 @@ function Floorplan({
               y={y}
               width={1}
               height={1}
-              fill={`hsla(${hueVal}, 95%, 48%, ${alpha})`}
+              fill={`hsla(${hueVal}, 96%, 50%, ${alpha})`}
               vectorEffect="non-scaling-stroke"
             >
-              <title>{`Cell (${x}, ${y}): RUDY wire demand = ${val.toFixed(2)}`}</title>
+              <title>{`Cell (${x}, ${y}): Wire Demand = ${val.toFixed(2)}`}</title>
             </rect>
           )
         })
       )}
 
+      {/* Grid Lines */}
       {showGrid && (
-        <g>
-          {minor && Array.from({ length: W - 1 }, (_, i) => <line key={`vx${i}`} x1={i + 1} y1={0} x2={i + 1} y2={H} className="fp-minor" vectorEffect="non-scaling-stroke" />)}
-          {minor && Array.from({ length: H - 1 }, (_, i) => <line key={`hy${i}`} x1={0} y1={i + 1} x2={W} y2={i + 1} className="fp-minor" vectorEffect="non-scaling-stroke" />)}
-          {ticks(W).map((t) => <line key={`mx${t}`} x1={t} y1={0} x2={t} y2={H} className="fp-major" vectorEffect="non-scaling-stroke" />)}
-          {ticks(H).map((t) => <line key={`my${t}`} x1={0} y1={t} x2={t} y2={H} className="fp-major" vectorEffect="non-scaling-stroke" />)}
+        <g className="fp-grid-group">
+          {minor && <rect x={0} y={0} width={W} height={H} fill="url(#eda-grid-minor)" />}
+          {ticks(W).map((t) => (
+            <line key={`mx${t}`} x1={t} y1={0} x2={t} y2={H} className="fp-major" vectorEffect="non-scaling-stroke" />
+          ))}
+          {ticks(H).map((t) => (
+            <line key={`my${t}`} x1={0} y1={t} x2={W} y2={t} className="fp-major" vectorEffect="non-scaling-stroke" />
+          ))}
         </g>
       )}
 
-      {!compact && ticks(W).map((t) => <text key={`tx${t}`} x={t} y={-fs * 0.5} fontSize={fs} textAnchor="middle" className="fp-tick">{t}</text>)}
-      {!compact && ticks(H).map((t) => <text key={`ty${t}`} x={-fs * 0.5} y={t + fs * 0.35} fontSize={fs} textAnchor="end" className="fp-tick">{t}</text>)}
+      {/* Rulers / Coordinate Labels */}
+      {!compact && (
+        <g className="fp-rulers" aria-hidden="true">
+          {ticks(W).map((t) => (
+            <text key={`tx${t}`} x={t} y={-fs * 0.45} fontSize={fs * 0.9} textAnchor="middle" className="fp-tick">
+              {t}
+            </text>
+          ))}
+          {ticks(H).map((t) => (
+            <text key={`ty${t}`} x={-fs * 0.4} y={t + fs * 0.35} fontSize={fs * 0.9} textAnchor="end" className="fp-tick">
+              {t}
+            </text>
+          ))}
+          <text x={-fs * 0.4} y={-fs * 0.45} fontSize={fs * 0.8} textAnchor="end" className="fp-tick-origin">
+            (0,0)
+          </text>
+        </g>
+      )}
 
       {/* Macros */}
       {placement.map((q) => {
         const m = dims.get(q.macro_id)
         if (!m) return null
         const label = `M${m.id}`
-        const f = Math.min(m.h * 0.34, m.w / (label.length * 0.62))
-        const two = m.h >= 3 && m.w >= 3.5 && !compact
+        const isSelected = selectedMacroId === m.id
+        const f = Math.min(m.h * 0.28, m.w / (label.length * 0.72), 1.6)
+        const two = m.h >= 2.8 && m.w >= 3.2 && !compact
         const macroOpacity = showHeatmap ? 0.88 : 0.94
+
         return (
-          <g key={q.macro_id}>
-            <rect x={q.x} y={q.y} width={m.w} height={m.h} rx={Math.min(m.w, m.h) * 0.06}
+          <g
+            key={q.macro_id}
+            className={`fp-macro-group ${isSelected ? 'selected' : ''}`}
+            onClick={(e) => {
+              e.stopPropagation()
+              onSelectMacro?.(isSelected ? null : m.id)
+            }}
+            style={{ cursor: 'pointer' }}
+          >
+            <rect
+              x={q.x}
+              y={q.y}
+              width={m.w}
+              height={m.h}
               fill={`hsl(${hue(m.id)} 62% 62% / ${macroOpacity})`}
-              stroke={showHeatmap ? '#ffffff' : 'currentColor'}
-              strokeWidth={showHeatmap ? Math.max(0.2, Math.min(W, H) * 0.006) : undefined}
-              className="fp-macro" vectorEffect="non-scaling-stroke">
-              <title>{`Macro ${m.id}: ${m.w}×${m.h} at (${q.x}, ${q.y})`}</title>
+              stroke={isSelected ? '#E5E7EB' : 'rgba(10, 16, 36, 0.45)'}
+              strokeWidth={isSelected ? 0.35 : 0.12}
+              className="fp-macro"
+              vectorEffect="non-scaling-stroke"
+            >
+              <title>{`Macro M${m.id} (${m.w}×${m.h}) placed at (${q.x}, ${q.y})`}</title>
             </rect>
-            {showLabels && f > 0.35 && (
-              <text x={q.x + m.w / 2} y={q.y + m.h / 2 + (two ? -f * 0.1 : f * 0.35)} fontSize={f} textAnchor="middle" className="fp-label">
+            {showLabels && f > 0.32 && (
+              <text
+                x={q.x + m.w / 2}
+                y={q.y + m.h / 2 + (two ? -f * 0.12 : f * 0.35)}
+                fontSize={f}
+                textAnchor="middle"
+                className="fp-label"
+              >
                 {label}
-                {two && <tspan x={q.x + m.w / 2} dy={f * 1.05} fontSize={f * 0.62} fontWeight={400}>{m.w}×{m.h}</tspan>}
+                {two && (
+                  <tspan x={q.x + m.w / 2} dy={f * 1.05} fontSize={f * 0.65} fontWeight={400}>
+                    {m.w}×{m.h}
+                  </tspan>
+                )}
               </text>
             )}
           </g>
         )
       })}
 
-      {/* Nets */}
+      {/* Net Flylines */}
       {showNets && nl.nets.map((n) => {
         const cs = n.macro_ids.map(center).filter((c): c is { x: number; y: number } => c !== null)
         if (cs.length < 2) return null
         const cx = cs.reduce((s, c) => s + c.x, 0) / cs.length
         const cy = cs.reduce((s, c) => s + c.y, 0) / cs.length
+
+        const isHighlighted = selectedMacroId != null && connectedNets.has(n.id)
+        const isDimmed = selectedMacroId != null && !connectedNets.has(n.id)
+
+        const strokeCol = isHighlighted ? 'var(--net-highlight)' : 'var(--net-color)'
+        const strokeW = isHighlighted
+          ? Math.min(1.8, 0.8 + n.weight * 0.25)
+          : Math.min(1.2, 0.5 + n.weight * 0.15)
+        const netOpacity = isDimmed ? 0.1 : isHighlighted ? 0.95 : 0.55
+
+        if (cs.length === 2) {
+          return (
+            <g
+              key={`n${n.id}`}
+              className={`fp-net ${isHighlighted ? 'highlighted' : ''}`}
+              stroke={strokeCol}
+              strokeWidth={strokeW}
+              opacity={netOpacity}
+            >
+              <title>{`Net ${n.id} (weight ${n.weight}): macros ${n.macro_ids.join(', ')}`}</title>
+              <line x1={cs[0].x} y1={cs[0].y} x2={cs[1].x} y2={cs[1].y} vectorEffect="non-scaling-stroke" />
+            </g>
+          )
+        }
+
         return (
-          <g key={`n${n.id}`} className="fp-net" strokeWidth={Math.min(3, 0.8 + n.weight * 0.4)}>
+          <g
+            key={`n${n.id}`}
+            className={`fp-net ${isHighlighted ? 'highlighted' : ''}`}
+            stroke={strokeCol}
+            strokeWidth={strokeW}
+            opacity={netOpacity}
+          >
             <title>{`Net ${n.id} (weight ${n.weight}): macros ${n.macro_ids.join(', ')}`}</title>
-            {cs.map((c, i) => <line key={i} x1={cx} y1={cy} x2={c.x} y2={c.y} vectorEffect="non-scaling-stroke" />)}
-            <circle cx={cx} cy={cy} r={Math.max(W, H) * 0.008} className="fp-netdot" />
+            {cs.map((c, i) => (
+              <line key={i} x1={cx} y1={cy} x2={c.x} y2={c.y} vectorEffect="non-scaling-stroke" />
+            ))}
           </g>
         )
       })}
+
+      {/* Chip Die Outer Border */}
       <rect x={0} y={0} width={W} height={H} className="fp-border" vectorEffect="non-scaling-stroke" />
     </svg>
   )
@@ -369,12 +475,12 @@ function Floorplan({
 function ConvergenceChart({ trace, totalSteps, compact }: { trace: TracePoint[]; totalSteps: number; compact?: boolean }) {
   if (trace.length === 0) return null
 
-  const W = compact ? 260 : 540
-  const H = compact ? 110 : 160
-  const padL = compact ? 36 : 46
-  const padR = 14
-  const padT = 16
-  const padB = compact ? 22 : 28
+  const W = compact ? 280 : 640
+  const H = compact ? 120 : 180
+  const padL = compact ? 38 : 50
+  const padR = 16
+  const padT = 18
+  const padB = compact ? 24 : 32
 
   const plotW = W - padL - padR
   const plotH = H - padT - padB
@@ -389,34 +495,41 @@ function ConvergenceChart({ trace, totalSteps, compact }: { trace: TracePoint[];
   const scaleY = (v: number) => padT + plotH - ((v - minH) / hRange) * plotH
 
   const pts = trace.map((p) => `${scaleX(p.step).toFixed(1)},${scaleY(p.hpwl).toFixed(1)}`).join(' ')
+  const initialHpwl = trace[0]?.hpwl ?? maxH
+  const reductionPct = initialHpwl > 0 ? (((initialHpwl - minH) / initialHpwl) * 100).toFixed(1) : '0'
 
   return (
     <div className="trace-chart">
       <div className="trace-head">
-        <strong>Optimization Convergence Curve</strong>
-        <span className="hint">HPWL: initial {fmt(trace[0]?.hpwl, 1)} → best {fmt(minH, 1)}</span>
+        <div className="trace-title">
+          <span>OPTIMIZATION CONVERGENCE</span>
+          <span className="mono text-accent">HPWL Trace</span>
+        </div>
+        <div className="trace-stats mono text-xs">
+          <span>Init: <strong>{fmt(initialHpwl, 1)}</strong></span>
+          <span>Best: <strong className="text-ok">{fmt(minH, 1)}</strong></span>
+          <span className="badge badge-ok">-{reductionPct}%</span>
+        </div>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="chart-svg" role="img" aria-label="Convergence chart">
-        {/* Background gridlines */}
+        {/* Background Grid */}
         <line x1={padL} y1={padT} x2={padL + plotW} y2={padT} stroke="var(--border)" strokeDasharray="3 3" />
         <line x1={padL} y1={padT + plotH / 2} x2={padL + plotW} y2={padT + plotH / 2} stroke="var(--border)" strokeDasharray="3 3" />
         <line x1={padL} y1={padT + plotH} x2={padL + plotW} y2={padT + plotH} stroke="var(--border)" />
         <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="var(--border)" />
 
-        {/* Y Axis ticks */}
-        <text x={padL - 6} y={padT + 4} textAnchor="end" className="chart-tick">{fmt(maxH, 0)}</text>
-        <text x={padL - 6} y={padT + plotH} textAnchor="end" className="chart-tick">{fmt(minH, 0)}</text>
+        {/* Ticks */}
+        <text x={padL - 8} y={padT + 4} textAnchor="end" className="chart-tick">{fmt(maxH, 0)}</text>
+        <text x={padL - 8} y={padT + plotH} textAnchor="end" className="chart-tick">{fmt(minH, 0)}</text>
+        <text x={padL} y={H - 8} textAnchor="start" className="chart-tick">Step 0</text>
+        <text x={padL + plotW} y={H - 8} textAnchor="end" className="chart-tick">Step {maxStep}</text>
 
-        {/* X Axis ticks */}
-        <text x={padL} y={H - 5} textAnchor="start" className="chart-tick">Step 0</text>
-        <text x={padL + plotW} y={H - 5} textAnchor="end" className="chart-tick">Step {maxStep}</text>
+        {/* Trace Curve */}
+        <polyline fill="none" stroke="var(--accent)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" points={pts} />
 
-        {/* Polyline */}
-        <polyline fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" points={pts} />
-
-        {/* Trace dots */}
+        {/* Trace Points */}
         {trace.map((p, i) => (
-          <circle key={i} cx={scaleX(p.step)} cy={scaleY(p.hpwl)} r={compact ? 2.5 : 3.5} fill="var(--accent)" stroke="#ffffff" strokeWidth="1">
+          <circle key={i} cx={scaleX(p.step)} cy={scaleY(p.hpwl)} r={compact ? 2 : 3} fill="var(--accent)" stroke="#090d16" strokeWidth="1">
             <title>{`Step ${p.step}: HPWL ${p.hpwl.toFixed(1)}${p.congestion != null ? `, Congestion ${p.congestion.toFixed(2)}` : ''}`}</title>
           </circle>
         ))}
@@ -427,8 +540,9 @@ function ConvergenceChart({ trace, totalSteps, compact }: { trace: TracePoint[];
 
 /* ───────────────────────── Main App ───────────────────────── */
 export default function App() {
+  const [activeTab, setActiveTab] = useState<'placement' | 'experiments'>('placement')
   const [apiUrl, setApiUrl] = useState(DEFAULT_API)
-  const [conn, setConn] = useState<{ state: 'checking' | 'ok' | 'down'; msg: string }>({ state: 'checking', msg: 'Checking…' })
+  const [conn, setConn] = useState<{ state: 'checking' | 'ok' | 'down'; msg: string }>({ state: 'checking', msg: 'Connecting…' })
   const [registry, setRegistry] = useState<string[] | null>(null)
   const [benchmarks, setBenchmarks] = useState<BenchmarkSummary[]>([])
 
@@ -446,10 +560,21 @@ export default function App() {
   const [view, setView] = useState('greedy')
   const [busy, setBusy] = useState<null | 'single' | 'compare'>(null)
   const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; lines: string[] } | null>(null)
+
+  // View Modes & Display Toggles
+  const [viewMode, setViewMode] = useState<ViewMode>('placement')
   const [showGrid, setShowGrid] = useState(true)
   const [showNets, setShowNets] = useState(true)
   const [showLabels, setShowLabels] = useState(true)
   const [showHeatmap, setShowHeatmap] = useState(false)
+
+  // Interactive Selection
+  const [selectedMacroId, setSelectedMacroId] = useState<number | null>(null)
+
+  // Bottom Analysis Drawer Tab
+  const [bottomTab, setBottomTab] = useState<BottomTab>('convergence')
+  const [configTab, setConfigTab] = useState<ConfigSubTab>('design')
+
   const [rudyData, setRudyData] = useState<Record<string, RudyData>>({})
   const [history, setHistory] = useState<HistoryRow[] | null>(null)
   const [histErr, setHistErr] = useState<string | null>(null)
@@ -458,28 +583,46 @@ export default function App() {
 
   const base = apiUrl.trim().replace(/\/+$/, '')
   const built = useMemo(() => buildNetlist(gw, gh, macros, nets), [gw, gh, macros, nets])
-  const curKey = built.netlist ? JSON.stringify(built.netlist) : ''
   const rlKey = registry?.find((n) => RL_RE.test(n)) ?? null
   const isAvail = (k: string) => (registry ? registry.includes(k) : true)
 
-  /* connection, algorithm registry, and benchmark suites discovery */
+  /* Apply preset view mode changes */
+  const handleViewModeChange = (mode: ViewMode) => {
+    setViewMode(mode)
+    if (mode === 'placement') {
+      setShowGrid(true)
+      setShowNets(false)
+      setShowLabels(true)
+      setShowHeatmap(false)
+    } else if (mode === 'connectivity') {
+      setShowGrid(true)
+      setShowNets(true)
+      setShowLabels(true)
+      setShowHeatmap(false)
+    } else if (mode === 'congestion') {
+      setShowGrid(true)
+      setShowNets(false)
+      setShowLabels(true)
+      setShowHeatmap(true)
+    }
+  }
+
+  /* Connection check */
   const checkApi = useCallback(async () => {
-    setConn({ state: 'checking', msg: 'Checking…' })
+    setConn({ state: 'checking', msg: 'Checking API…' })
     try {
       const h = await api<{ status: string; version: string }>(base, '/health')
-      setConn({ state: 'ok', msg: `Connected · API v${h.version}` })
+      setConn({ state: 'ok', msg: `Connected · v${h.version}` })
     } catch (e) {
-      setConn({ state: 'down', msg: errMsg(e) })
+      setConn({ state: 'down', msg: 'API Offline' })
       setRegistry(null)
       return
     }
 
-    // Try direct algorithms endpoint first
     try {
       const algRes = await api<{ algorithms: string[] }>(base, '/api/algorithms')
       setRegistry(algRes.algorithms)
     } catch {
-      // Fallback probe
       try {
         await api(base, '/api/placements/run', {
           method: 'POST',
@@ -495,7 +638,6 @@ export default function App() {
       }
     }
 
-    // Load available standard benchmarks
     try {
       const bm = await api<{ benchmarks: BenchmarkSummary[] }>(base, '/api/benchmarks')
       setBenchmarks(bm.benchmarks ?? [])
@@ -505,11 +647,11 @@ export default function App() {
   }, [base])
 
   useEffect(() => {
-    const t = setTimeout(() => void checkApi(), 400)
+    const t = setTimeout(() => void checkApi(), 300)
     return () => clearTimeout(t)
   }, [checkApi])
 
-  /* run orchestration */
+  /* Run orchestration */
   const params = (a: string): Record<string, unknown> =>
     a === 'sa' || a === 'simulated_annealing'
       ? { max_iterations: toInt(saIter), initial_temperature: toNum(saTemp), cooling_rate: toNum(saCool), alpha: 1.0, beta: 1.0 }
@@ -564,11 +706,11 @@ export default function App() {
     catch (e) { setHistErr(errMsg(e)) }
   }
 
-  /* config editing */
+  /* Config handlers */
   const setM = (i: number, k: keyof MacroRow, v: string) => setMacros((m) => m.map((r, j) => (j === i ? { ...r, [k]: v } : r)))
   const setN = (i: number, k: keyof NetRow, v: string) => setNets((m) => m.map((r, j) => (j === i ? { ...r, [k]: v } : r)))
   const nextId = (rows: { id: string }[]) => String(Math.max(-1, ...rows.map((r) => toInt(r.id)).filter((x) => x >= 0)) + 1)
-  const addMacro = () => setMacros((m) => [...m, { id: nextId(m), w: '3', h: '3' }])
+  const addMacro = () => setMacros((m) => [...m, { id: nextId(m), w: '4', h: '3' }])
   const addNet = () => setNets((n) => [...n, { id: nextId(n), ids: '', weight: '1' }])
   const resetExample = () => { setGw('20'); setGh('16'); setMacros(DEFAULT_MACROS); setNets(DEFAULT_NETS); setSeed('42'); setNotice(null) }
 
@@ -579,7 +721,8 @@ export default function App() {
       setGh(String(nl.grid_h))
       setMacros(nl.macros.map((m) => ({ id: String(m.id), w: String(m.w), h: String(m.h) })))
       setNets(nl.nets.map((x) => ({ id: String(x.id), ids: x.macro_ids.join(', '), weight: String(x.weight ?? 1) })))
-      setNotice({ kind: 'ok', lines: [`Loaded benchmark preset '${name}': ${nl.macros.length} macros, ${nl.nets.length} nets, ${nl.grid_w}×${nl.grid_h} grid.`] })
+      setSelectedMacroId(null)
+      setNotice({ kind: 'ok', lines: [`Loaded benchmark '${name}': ${nl.macros.length} macros, ${nl.nets.length} nets (${nl.grid_w}×${nl.grid_h}).`] })
     } catch (e) {
       setNotice({ kind: 'error', lines: [`Failed to load benchmark '${name}': ${errMsg(e)}`] })
     }
@@ -596,21 +739,40 @@ export default function App() {
       setGw(String(n.grid_w)); setGh(String(n.grid_h))
       setMacros(n.macros.map((m) => ({ id: String(m.id), w: String(m.w), h: String(m.h) })))
       setNets(n.nets.map((x) => ({ id: String(x.id), ids: x.macro_ids.join(', '), weight: String(x.weight ?? 1) })))
-      setNotice({ kind: 'ok', lines: [`Imported ${f.name}.`] })
+      setSelectedMacroId(null)
+      setNotice({ kind: 'ok', lines: [`Imported netlist from ${f.name}.`] })
     }).catch((err) => setNotice({ kind: 'error', lines: [`Import failed: ${errMsg(err)}`] }))
   }
 
-  /* derived view data */
+  /* Derived view data */
   const rec = runs[view]
   const previewNl: Netlist = { version: '1.0', grid_w: toInt(gw) > 0 ? toInt(gw) : 20, grid_h: toInt(gh) > 0 ? toInt(gh) : 16, macros: [], nets: [] }
-  const shownNl = rec?.netlist ?? previewNl
-  const stale = (r: RunRec) => curKey !== JSON.stringify(r.netlist)
-  const finished = Object.values(runs).filter((r) => r.status === 'completed' && r.hpwl != null)
-  const best = finished.length ? Math.min(...finished.map((r) => r.hpwl as number)) : null
-  const issues = rec?.status === 'completed' ? checkLegal(rec.netlist, rec.placement) : []
+  const currentConfigSignature = built.netlist ? JSON.stringify(built.netlist) : ''
+  const isStale = rec != null && (
+    built.errors.length > 0 ||
+    currentConfigSignature === '' ||
+    JSON.stringify(rec.netlist) !== currentConfigSignature
+  )
+  const shownNl = built.netlist ?? previewNl
+  const isRunCurrent = (r: RunRec | undefined) =>
+    r != null && currentConfigSignature !== '' && JSON.stringify(r.netlist) === currentConfigSignature
+  const currentFinished = Object.values(runs).filter(
+    (r) => isRunCurrent(r) && r.status === 'completed' && r.hpwl != null
+  )
+  const bestObj = currentFinished.length ? Math.min(...currentFinished.map((r) => (r.objective ?? r.hpwl) as number)) : null
+  const issues = rec?.status === 'completed' && !isStale ? checkLegal(rec.netlist, rec.placement) : []
   const running = !!rec && ['submitting', 'pending', 'running'].includes(rec.status)
 
-  /* Fetch RUDY data when a placement is completed */
+  /* Automatically deselect macro if it no longer exists in current configuration */
+  useEffect(() => {
+    if (selectedMacroId != null && built.netlist) {
+      if (!built.netlist.macros.some((m) => m.id === selectedMacroId)) {
+        setSelectedMacroId(null)
+      }
+    }
+  }, [selectedMacroId, built.netlist])
+
+  /* RUDY Fetch */
   const activeRunId = rec?.runId
   useEffect(() => {
     if (rec?.status === 'completed' && activeRunId && !rudyData[activeRunId]) {
@@ -620,9 +782,19 @@ export default function App() {
     }
   }, [rec?.status, activeRunId, base, rudyData])
 
-  const curRudy = activeRunId ? rudyData[activeRunId] : null
+  const curRudy = !isStale && activeRunId ? rudyData[activeRunId] : null
 
-  /* exports */
+  /* Selected Macro Details */
+  const selectedMacro = useMemo(() => {
+    if (selectedMacroId == null) return null
+    const m = shownNl.macros.find((x) => x.id === selectedMacroId)
+    const p = !isStale ? rec?.placement.find((x) => x.macro_id === selectedMacroId) : undefined
+    const connected = shownNl.nets.filter((n) => n.macro_ids.includes(selectedMacroId))
+    const isOutOfBounds = p ? p.x < 0 || p.y < 0 || p.x + (m?.w ?? 0) > shownNl.grid_w || p.y + (m?.h ?? 0) > shownNl.grid_h : false
+    return { macro: m, placed: p, connectedNets: connected, isOutOfBounds }
+  }, [selectedMacroId, shownNl, isStale, rec?.placement])
+
+  /* Exports */
   const exportable = Object.values(runs).filter((r) => r.status === 'completed')
   const exportJson = () => download('macro-placement-results.json', 'application/json', JSON.stringify({
     exported_at: new Date().toISOString(), api_url: base,
@@ -665,332 +837,760 @@ export default function App() {
   const stCls = (s: string) => `st st-${s}`
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="logo" aria-hidden>▦</span>
-          <div><h1>Macro Placement Studio</h1><p>Graph-theoretic floorplanning · Random · Greedy · SA · RL</p></div>
+    <div className="eda-app">
+      {/* ───────── Top Navigation Bar ───────── */}
+      <header className="eda-topbar">
+        <div className="eda-brand">
+          <div className="eda-logo-icon">◈</div>
+          <div className="eda-brand-text">
+            <h1>MACRO PLACEMENT LAB</h1>
+            <p>Graph-Theoretic Floorplanning Research Platform</p>
+          </div>
         </div>
-        <div className={`conn conn-${conn.state}`} title={conn.msg}>
-          <span className="dot" /> <span className="conn-msg">{conn.msg}</span>
-          <button className="btn sm" onClick={() => void checkApi()}>Recheck</button>
+
+        <nav className="eda-nav-tabs" role="tablist" aria-label="Main Navigation">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'placement'}
+            className={`eda-nav-tab ${activeTab === 'placement' ? 'active' : ''}`}
+            onClick={() => setActiveTab('placement')}
+          >
+            <span className="tab-glyph">▦</span> Placement Studio
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'experiments'}
+            className={`eda-nav-tab ${activeTab === 'experiments' ? 'active' : ''}`}
+            onClick={() => setActiveTab('experiments')}
+          >
+            <span className="tab-glyph">📊</span> Research Experiments
+          </button>
+        </nav>
+
+        <div className="eda-top-right">
+          <div className={`eda-conn eda-conn-${conn.state}`} title={conn.msg}>
+            <span className="eda-conn-dot" />
+            <span className="eda-conn-label">{conn.state === 'ok' ? conn.msg : conn.state === 'checking' ? 'Checking…' : 'API Offline'}</span>
+            <button className="btn btn-xs" onClick={() => void checkApi()} title="Re-check API connection">
+              Recheck
+            </button>
+          </div>
         </div>
       </header>
 
-      <div className="layout">
-        {/* ───────── Sidebar ───────── */}
-        <aside className="sidebar">
-          <section className="panel">
-            <h2>Connection</h2>
-            <label className="field"><span>API base URL</span>
-              <input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} spellCheck={false} />
-            </label>
-            <p className="hint">{registry ? <>Backend algorithms: <code>{registry.join(', ')}</code></> : 'Backend algorithm list unavailable.'}</p>
-          </section>
-
-          {/* Standard Benchmark Presets */}
-          <section className="panel">
-            <h2>Standard Benchmarks</h2>
-            <p className="hint">Select a synthetic benchmark to auto-fill the grid and circuit:</p>
-            <div className="btn-row wrap">
-              {benchmarks.length > 0 ? (
-                benchmarks.map((b) => (
-                  <button key={b.name} className="btn sm" onClick={() => void loadBenchmarkPreset(b.name)}>
-                    {b.name} ({b.macro_count}m)
-                  </button>
-                ))
-              ) : (
-                <>
-                  <button className="btn sm" onClick={() => void loadBenchmarkPreset('toy_4')}>toy_4 (4m)</button>
-                  <button className="btn sm" onClick={() => void loadBenchmarkPreset('medium_8')}>medium_8 (8m)</button>
-                  <button className="btn sm" onClick={() => void loadBenchmarkPreset('dense_10')}>dense_10 (10m)</button>
-                </>
-              )}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h2>Chip grid</h2>
-            <div className="row2">
-              <label className="field"><span>Width</span><input inputMode="numeric" value={gw} onChange={(e) => setGw(e.target.value)} /></label>
-              <label className="field"><span>Height</span><input inputMode="numeric" value={gh} onChange={(e) => setGh(e.target.value)} /></label>
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-head"><h2>Macros <small>{macros.length}</small></h2><button className="btn sm" onClick={addMacro}>+ Add</button></div>
-            <div className="table-edit">
-              <div className="th"><span>ID</span><span>W</span><span>H</span><span /></div>
-              {macros.map((m, i) => (
-                <div className="tr" key={i}>
-                  <input aria-label="Macro ID" value={m.id} onChange={(e) => setM(i, 'id', e.target.value)} />
-                  <input aria-label="Macro width" value={m.w} onChange={(e) => setM(i, 'w', e.target.value)} />
-                  <input aria-label="Macro height" value={m.h} onChange={(e) => setM(i, 'h', e.target.value)} />
-                  <button className="btn icon" aria-label="Remove macro" onClick={() => setMacros((x) => x.filter((_, j) => j !== i))}>✕</button>
-                </div>
-              ))}
-              {macros.length === 0 && <p className="hint">No macros yet.</p>}
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-head"><h2>Nets <small>{nets.length}</small></h2><button className="btn sm" onClick={addNet}>+ Add</button></div>
-            <div className="table-edit nets">
-              <div className="th"><span>ID</span><span>Macro IDs</span><span>Wt</span><span /></div>
-              {nets.map((n, i) => (
-                <div className="tr" key={i}>
-                  <input aria-label="Net ID" value={n.id} onChange={(e) => setN(i, 'id', e.target.value)} />
-                  <input aria-label="Connected macro IDs" placeholder="0, 1, 2" value={n.ids} onChange={(e) => setN(i, 'ids', e.target.value)} />
-                  <input aria-label="Net weight" value={n.weight} onChange={(e) => setN(i, 'weight', e.target.value)} />
-                  <button className="btn icon" aria-label="Remove net" onClick={() => setNets((x) => x.filter((_, j) => j !== i))}>✕</button>
-                </div>
-              ))}
-              {nets.length === 0 && <p className="hint">No nets yet.</p>}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h2>Algorithm</h2>
-            <label className="field"><span>Method</span>
-              <select value={alg} onChange={(e) => { setAlg(e.target.value); if (runs[e.target.value]) setView(e.target.value) }}>
-                {ALGS.map((a) => <option key={a.key} value={a.key} disabled={!isAvail(a.key)}>{a.label}{isAvail(a.key) ? '' : ' (not registered)'}</option>)}
-                <option value={rlKey ?? 'rl'} disabled={!rlKey}>Reinforcement Learning{rlKey ? '' : ' — unavailable'}</option>
-              </select>
-            </label>
-            {!rlKey && <p className="hint">RL is not registered in the backend’s algorithm registry, so it cannot be run.</p>}
-            <label className="field"><span>Random seed</span><input inputMode="numeric" value={seed} onChange={(e) => setSeed(e.target.value)} /></label>
-            {alg === 'sa' || alg === 'simulated_annealing'
-              ? (
-                <div className="row3">
-                  <label className="field"><span>Max iters</span><input value={saIter} onChange={(e) => setSaIter(e.target.value)} /></label>
-                  <label className="field"><span>Init temp</span><input value={saTemp} onChange={(e) => setSaTemp(e.target.value)} /></label>
-                  <label className="field"><span>Cooling</span><input value={saCool} onChange={(e) => setSaCool(e.target.value)} /></label>
-                </div>
-              )
-              : <p className="hint">Select Simulated Annealing to edit its parameters (also used by Compare).</p>}
-          </section>
-
-          <section className="panel">
-            <h2>Netlist</h2>
-            {built.errors.length > 0
-              ? <ul className="issues">{built.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
-              : <p className="ok-text">✓ Input valid · {built.netlist?.macros.length} macros, {built.netlist?.nets.length} nets</p>}
-            <div className="btn-row">
-              <button className="btn" onClick={() => void validate()}>Validate with API</button>
-              <button className="btn" onClick={resetExample}>Reset example</button>
-              <button className="btn" onClick={exportNetlist}>Save netlist</button>
-              <button className="btn" onClick={() => fileRef.current?.click()}>Load netlist</button>
-              <input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={importNetlist} />
-            </div>
-          </section>
-        </aside>
-
-        {/* ───────── Main Content ───────── */}
-        <main className="main">
-          {notice && (
-            <div className={`banner banner-${notice.kind}`} role="alert">
-              <div>{notice.lines.map((l, i) => <div key={i}>{l}</div>)}</div>
-              <button className="btn icon" aria-label="Dismiss" onClick={() => setNotice(null)}>✕</button>
-            </div>
-          )}
-
-          <section className="panel runbar">
-            <div className="btn-row">
-              <button className="btn primary" disabled={!!busy || !isAvail(alg)} onClick={() => void runBatch([alg])}>
-                {busy === 'single' ? 'Running…' : `▶ Run ${algLabel(alg)}`}
-              </button>
-              <button className="btn accent" disabled={!!busy} onClick={() => void runBatch(compareAlgs)}>
-                {busy === 'compare' ? 'Comparing…' : `⇄ Compare ${compareAlgs.length} algorithms`}
-              </button>
-              <button className="btn" disabled={!busy} onClick={() => abortRef.current?.abort()}>■ Cancel</button>
-              <button className="btn" disabled={!!busy || !hasRuns} onClick={() => { setRuns({}); setRudyData({}); setNotice(null) }}>Clear results</button>
-            </div>
-            <p className="hint">Compare runs {compareAlgs.map(algLabel).join(', ')} sequentially on the same netlist, seed and parameters. Elapsed time is measured in your browser (submit → finished).</p>
-          </section>
-
-          <section className="panel">
-            <div className="panel-head wrap">
-              <h2>Floorplan <small>{shownNl.grid_w}×{shownNl.grid_h}</small></h2>
-              <div className="tabs" role="tablist">
-                {allKeys.map((k) => {
-                  const r = runs[k]
-                  return (
-                    <button key={k} role="tab" aria-selected={view === k} disabled={!r} className={`tab ${view === k ? 'active' : ''}`} onClick={() => setView(k)}
-                      title={r ? r.status : RL_RE.test(k) && !rlKey ? 'RL unavailable in backend' : 'Not run yet'}>
-                      {r && <span className={`pip pip-${r.status}`} />}{RL_RE.test(k) ? 'RL' : k === 'sa' ? 'SA' : algLabel(k)}
+      {/* ───────── Main Content Area ───────── */}
+      {activeTab === 'placement' ? (
+        <div className="eda-workspace-grid">
+          {/* ────── Column 1: Configuration Panel ────── */}
+          <aside className="eda-sidebar">
+            {/* Design Presets Bar */}
+            <section className="eda-panel">
+              <div className="panel-title">
+                <span>BENCHMARK PRESETS</span>
+              </div>
+              <div className="preset-pill-row">
+                {benchmarks.length > 0 ? (
+                  benchmarks.map((b) => (
+                    <button
+                      key={b.name}
+                      className="btn-preset"
+                      onClick={() => void loadBenchmarkPreset(b.name)}
+                      title={`${b.macro_count} macros, ${b.grid_w}×${b.grid_h} grid, ${b.net_count} nets`}
+                    >
+                      {b.name} <span className="preset-count">{b.macro_count}m</span>
                     </button>
-                  )
-                })}
+                  ))
+                ) : (
+                  <>
+                    <button className="btn-preset" onClick={() => void loadBenchmarkPreset('toy_4')}>toy_4 4m</button>
+                    <button className="btn-preset" onClick={() => void loadBenchmarkPreset('medium_8')}>medium_8 8m</button>
+                    <button className="btn-preset" onClick={() => void loadBenchmarkPreset('dense_10')}>dense_10 10m</button>
+                  </>
+                )}
               </div>
-              <div className="toggles">
-                <label><input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Grid</label>
-                <label><input type="checkbox" checked={showNets} onChange={(e) => setShowNets(e.target.checked)} /> Nets</label>
-                <label><input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} /> Labels</label>
-                <label><input type="checkbox" checked={showHeatmap} onChange={(e) => setShowHeatmap(e.target.checked)} /> RUDY Heatmap</label>
+            </section>
+
+            {/* Config Sub-Tabs */}
+            <section className="eda-panel flex-1">
+              <div className="config-subtabs">
+                <button
+                  className={`cfg-tab ${configTab === 'design' ? 'active' : ''}`}
+                  onClick={() => setConfigTab('design')}
+                >
+                  Canvas & Rules
+                </button>
+                <button
+                  className={`cfg-tab ${configTab === 'macros' ? 'active' : ''}`}
+                  onClick={() => setConfigTab('macros')}
+                >
+                  Macros ({macros.length})
+                </button>
+                <button
+                  className={`cfg-tab ${configTab === 'nets' ? 'active' : ''}`}
+                  onClick={() => setConfigTab('nets')}
+                >
+                  Nets ({nets.length})
+                </button>
+              </div>
+
+              {configTab === 'design' && (
+                <div className="cfg-tab-pane">
+                  <div className="field-grid-2">
+                    <label className="eda-field">
+                      <span>Grid Width (X)</span>
+                      <input inputMode="numeric" value={gw} onChange={(e) => setGw(e.target.value)} />
+                    </label>
+                    <label className="eda-field">
+                      <span>Grid Height (Y)</span>
+                      <input inputMode="numeric" value={gh} onChange={(e) => setGh(e.target.value)} />
+                    </label>
+                  </div>
+
+                  <div className="eda-field" style={{ marginTop: '10px' }}>
+                    <span>Random Seed</span>
+                    <input inputMode="numeric" value={seed} onChange={(e) => setSeed(e.target.value)} />
+                  </div>
+
+                  <div className="eda-field" style={{ marginTop: '10px' }}>
+                    <span>API Base URL</span>
+                    <input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} spellCheck={false} />
+                  </div>
+
+                  {built.errors.length > 0 ? (
+                    <div className="notice-error-box">
+                      {built.errors.map((err, idx) => (
+                        <div key={idx}>⚠ {err}</div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="notice-ok-box">
+                      ✓ Valid: {built.netlist?.macros.length} macros, {built.netlist?.nets.length} nets ({gw}×{gh} grid).
+                    </div>
+                  )}
+
+                  <div className="btn-action-row" style={{ marginTop: '12px' }}>
+                    <button className="btn btn-sm" onClick={() => void validate()}>Validate API</button>
+                    <button className="btn btn-sm" onClick={resetExample}>Reset Example</button>
+                    <button className="btn btn-sm" onClick={exportNetlist}>Save JSON</button>
+                    <button className="btn btn-sm" onClick={() => fileRef.current?.click()}>Load JSON</button>
+                    <input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={importNetlist} />
+                  </div>
+                </div>
+              )}
+
+              {configTab === 'macros' && (
+                <div className="cfg-tab-pane">
+                  <div className="table-header-row">
+                    <span>ID</span>
+                    <span>Width</span>
+                    <span>Height</span>
+                    <button className="btn-xs-add" onClick={addMacro}>+ Add</button>
+                  </div>
+                  <div className="table-rows-scroll">
+                    {macros.map((m, i) => (
+                      <div className="table-input-row" key={i}>
+                        <input aria-label="Macro ID" value={m.id} onChange={(e) => setM(i, 'id', e.target.value)} />
+                        <input aria-label="Macro width" value={m.w} onChange={(e) => setM(i, 'w', e.target.value)} />
+                        <input aria-label="Macro height" value={m.h} onChange={(e) => setM(i, 'h', e.target.value)} />
+                        <button className="btn-row-del" onClick={() => setMacros((x) => x.filter((_, j) => j !== i))}>✕</button>
+                      </div>
+                    ))}
+                    {macros.length === 0 && <p className="hint">No macros added yet.</p>}
+                  </div>
+                </div>
+              )}
+
+              {configTab === 'nets' && (
+                <div className="cfg-tab-pane">
+                  <div className="table-header-row nets">
+                    <span>Net ID</span>
+                    <span>Macro IDs</span>
+                    <span>Weight</span>
+                    <button className="btn-xs-add" onClick={addNet}>+ Add</button>
+                  </div>
+                  <div className="table-rows-scroll">
+                    {nets.map((n, i) => (
+                      <div className="table-input-row nets" key={i}>
+                        <input aria-label="Net ID" value={n.id} onChange={(e) => setN(i, 'id', e.target.value)} />
+                        <input aria-label="Macro IDs" placeholder="0, 1" value={n.ids} onChange={(e) => setN(i, 'ids', e.target.value)} />
+                        <input aria-label="Weight" value={n.weight} onChange={(e) => setN(i, 'weight', e.target.value)} />
+                        <button className="btn-row-del" onClick={() => setNets((x) => x.filter((_, j) => j !== i))}>✕</button>
+                      </div>
+                    ))}
+                    {nets.length === 0 && <p className="hint">No nets added yet.</p>}
+                  </div>
+                </div>
+              )}
+            </section>
+
+            {/* Algorithm & Run Controls */}
+            <section className="eda-panel">
+              <div className="panel-title">
+                <span>SOLVER METHOD</span>
+              </div>
+              <div className="eda-field">
+                <select value={alg} onChange={(e) => { setAlg(e.target.value); if (runs[e.target.value]) setView(e.target.value) }}>
+                  {ALGS.map((a) => (
+                    <option key={a.key} value={a.key} disabled={!isAvail(a.key)}>
+                      {a.label} {!isAvail(a.key) ? '(not registered)' : ''}
+                    </option>
+                  ))}
+                  <option value={rlKey ?? 'rl'} disabled={!rlKey}>
+                    Reinforcement Learning (Maskable PPO) {!rlKey ? '— unavailable' : ''}
+                  </option>
+                </select>
+              </div>
+
+              {alg === 'sa' && (
+                <div className="field-grid-3" style={{ marginTop: '8px' }}>
+                  <label className="eda-field">
+                    <span>Max Iters</span>
+                    <input value={saIter} onChange={(e) => setSaIter(e.target.value)} />
+                  </label>
+                  <label className="eda-field">
+                    <span>Init Temp</span>
+                    <input value={saTemp} onChange={(e) => setSaTemp(e.target.value)} />
+                  </label>
+                  <label className="eda-field">
+                    <span>Cooling</span>
+                    <input value={saCool} onChange={(e) => setSaCool(e.target.value)} />
+                  </label>
+                </div>
+              )}
+
+              {/* Primary Action Buttons */}
+              <div className="run-controls-stack" style={{ marginTop: '12px' }}>
+                <button
+                  className="btn btn-primary btn-run"
+                  disabled={!!busy || !isAvail(alg)}
+                  onClick={() => void runBatch([alg])}
+                >
+                  {busy === 'single' ? 'Optimizing…' : `▶ Run ${algLabel(alg)}`}
+                </button>
+
+                <button
+                  className="btn btn-accent btn-compare"
+                  disabled={!!busy}
+                  onClick={() => void runBatch(compareAlgs)}
+                >
+                  {busy === 'compare' ? 'Evaluating All…' : `⇄ Compare ${compareAlgs.length} Algorithms`}
+                </button>
+
+                <div className="btn-pair">
+                  <button className="btn btn-danger" disabled={!busy} onClick={() => abortRef.current?.abort()}>
+                    ■ Cancel
+                  </button>
+                  <button className="btn" disabled={!!busy || !hasRuns} onClick={() => { setRuns({}); setRudyData({}); setNotice(null) }}>
+                    Clear
+                  </button>
+                </div>
+              </div>
+            </section>
+          </aside>
+
+          {/* ────── Column 2: Floorplan Hero Canvas ────── */}
+          <main className="eda-floorplan-hero">
+            {notice && (
+              <div className={`eda-alert eda-alert-${notice.kind}`}>
+                <div>{notice.lines.map((l, idx) => <div key={idx}>{l}</div>)}</div>
+                <button className="btn-close" onClick={() => setNotice(null)}>✕</button>
+              </div>
+            )}
+
+            {/* Floorplan Workspace Toolbar */}
+            <div className="floorplan-toolbar">
+              <div className="toolbar-left">
+                <span className="die-badge mono">
+                  CANVAS: {shownNl.grid_w}×{shownNl.grid_h}
+                </span>
+
+                {/* Algorithm Switcher Tabs */}
+                <div className="alg-tabs">
+                  {allKeys.map((k) => {
+                    const r = runs[k]
+                    return (
+                      <button
+                        key={k}
+                        className={`alg-tab-btn ${view === k ? 'active' : ''}`}
+                        disabled={!r}
+                        onClick={() => setView(k)}
+                        title={r ? `${algLabel(k)} (${r.status})` : 'Not run yet'}
+                      >
+                        {r && <span className={`tab-pip pip-${r.status}`} />}
+                        {RL_RE.test(k) ? 'RL' : k === 'sa' ? 'SA' : algLabel(k)}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+
+              {/* View Modes & Toggles */}
+              <div className="toolbar-right">
+                <div className="view-mode-group">
+                  <button
+                    className={`btn-mode ${viewMode === 'placement' ? 'active' : ''}`}
+                    onClick={() => handleViewModeChange('placement')}
+                    title="Placement geometry and macro IDs"
+                  >
+                    Placement
+                  </button>
+                  <button
+                    className={`btn-mode ${viewMode === 'connectivity' ? 'active' : ''}`}
+                    onClick={() => handleViewModeChange('connectivity')}
+                    title="Flylines from net centroids to macros"
+                  >
+                    Connectivity
+                  </button>
+                  <button
+                    className={`btn-mode ${viewMode === 'congestion' ? 'active' : ''}`}
+                    onClick={() => handleViewModeChange('congestion')}
+                    title="RUDY wire routing demand heatmap overlay"
+                  >
+                    Congestion
+                  </button>
+                </div>
+
+                <div className="layer-toggles">
+                  <label><input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Grid</label>
+                  <label><input type="checkbox" checked={showNets} onChange={(e) => setShowNets(e.target.checked)} /> Nets</label>
+                  <label><input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} /> Labels</label>
+                  <label><input type="checkbox" checked={showHeatmap} onChange={(e) => setShowHeatmap(e.target.checked)} /> RUDY</label>
+                </div>
               </div>
             </div>
 
-            <div className="stage">
+            {/* Central SVG Die Stage */}
+            <div className="die-stage">
               <Floorplan
                 nl={shownNl}
-                placement={rec?.placement ?? []}
+                placement={isStale ? [] : (rec?.placement ?? [])}
                 showGrid={showGrid}
                 showNets={showNets}
                 showLabels={showLabels}
                 showHeatmap={showHeatmap}
                 rudy={curRudy}
+                selectedMacroId={selectedMacroId}
+                onSelectMacro={setSelectedMacroId}
               />
-              {!rec && <div className="overlay"><strong>No placement yet</strong><span>Configure a netlist and press Run. Placements and RUDY density maps are rendered from API responses.</span></div>}
-              {rec && running && <div className="overlay light"><div className="spinner" /><span>{rec.status === 'submitting' ? 'Submitting…' : `${algLabel(rec.alg)} · ${Math.round(rec.progress * 100)}% (step ${rec.step}/${rec.total})`}</span></div>}
-              {rec?.status === 'failed' && <div className="overlay err"><strong>Run failed</strong><span>{rec.error}</span></div>}
-              {rec?.status === 'cancelled' && <div className="overlay"><strong>Cancelled</strong><span>{rec.error}</span></div>}
-              {rec?.status === 'completed' && rec.placement.length === 0 && <div className="overlay"><strong>Empty result</strong><span>The API returned no placed macros.</span></div>}
+
+              {/* Stale Configuration Empty State */}
+              {isStale && (
+                <div className="die-overlay stale-config-state">
+                  <div className="empty-glyph">⟲</div>
+                  <h3>CONFIGURATION CHANGED</h3>
+                  <p>The displayed placement belongs to a previous configuration.</p>
+                  <div className="stale-config-summary mono">
+                    Current configuration: <strong>{built.netlist ? built.netlist.macros.length : macros.length} macros</strong> ({built.netlist?.grid_w ?? gw}×{built.netlist?.grid_h ?? gh})
+                  </div>
+                  <p className="stale-config-hint">Generate a new placement to continue analysis.</p>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    disabled={!!busy || built.errors.length > 0 || !isAvail(alg)}
+                    onClick={() => void runBatch([alg])}
+                  >
+                    ▶ Run {algLabel(alg)} for Current Netlist
+                  </button>
+                </div>
+              )}
+
+              {/* Empty State */}
+              {!rec && !isStale && (
+                <div className="die-overlay empty-state">
+                  <div className="empty-glyph">◇</div>
+                  <h3>NO PLACEMENT GENERATED</h3>
+                  <p>Select a benchmark preset or edit custom netlist dimensions, then run an optimization algorithm.</p>
+                  <button className="btn btn-primary btn-sm" onClick={() => void runBatch(['greedy'])}>
+                    ▶ Run Greedy Benchmark
+                  </button>
+                </div>
+              )}
+
+              {/* Optimizing State Overlay */}
+              {rec && !isStale && running && (
+                <div className="die-overlay running-state">
+                  <div className="spinner-eda" />
+                  <div className="optimizing-text">
+                    <h4>OPTIMIZING PLACEMENT</h4>
+                    <p className="mono">Algorithm: {algLabel(rec.alg)} · Seed {rec.seed}</p>
+                    <div className="progress-track">
+                      <div className="progress-fill" style={{ width: `${Math.round(rec.progress * 100)}%` }} />
+                    </div>
+                    <span className="mono text-xs">Step {rec.step} of {rec.total} ({Math.round(rec.progress * 100)}%)</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Error / Cancelled Overlay */}
+              {rec && !isStale && rec?.status === 'failed' && (
+                <div className="die-overlay err-state">
+                  <h4>PLACEMENT RUN FAILED</h4>
+                  <p>{rec.error}</p>
+                </div>
+              )}
             </div>
 
+            {/* RUDY Demand Colorbar Legend */}
             {showHeatmap && curRudy && (
-              <div className="heatmap-legend">
-                <span>RUDY Wire Demand:</span>
-                <span className="heat-box low">0.0 (low)</span>
-                <div className="heatmap-bar" />
-                <span className="heat-box high">{curRudy.max_demand.toFixed(1)} (hotspot)</span>
-                <span className="hint">· Congestion score C_score: <strong>{curRudy.congestion_score.toFixed(3)}</strong></span>
+              <div className="eda-heatmap-legend">
+                <span className="legend-label">RUDY WIRE DEMAND:</span>
+                <span className="mono text-xs text-accent">0.0 (low)</span>
+                <div className="legend-bar-gradient" />
+                <span className="mono text-xs text-warn">{curRudy.max_demand.toFixed(1)} (hotspot)</span>
+                <span className="legend-score mono">
+                  Congestion C_score: <strong className="text-accent">{curRudy.congestion_score.toFixed(3)}</strong>
+                </span>
               </div>
             )}
+          </main>
 
-            {rec && stale(rec) && <p className="warn-text">⚠ The configuration changed since this result was produced; the layout shows the original netlist.</p>}
-            <p className="hint">Origin (0, 0) is the top-left corner; x grows right, y grows down. Net lines run from each net’s centroid to its macro centers.</p>
+          {/* ────── Column 3: Metrics & Inspector ────── */}
+          <aside className="eda-inspector-column">
+            {/* Primary Placement Result Panel */}
+            <section className="eda-panel">
+              <div className="panel-title">
+                <span>PLACEMENT RESULT</span>
+                {rec && (
+                  isStale ? (
+                    <span className="badge badge-muted">stale config</span>
+                  ) : (
+                    <span className={`st ${stCls(rec.status)}`}>{rec.status}</span>
+                  )
+                )}
+              </div>
 
-            {/* Optimization Convergence Curve */}
-            {rec?.trace && rec.trace.length > 1 && (
-              <ConvergenceChart trace={rec.trace} totalSteps={rec.total} />
-            )}
-          </section>
+              {/* Combined Objective Hero Display */}
+              <div className="metric-hero-box">
+                <div className="hero-top">
+                  <span className="hero-label">COMBINED OBJECTIVE J(P)</span>
+                  <span className="badge-lower-better">LOWER IS BETTER</span>
+                </div>
+                <div className="hero-value mono">
+                  {rec?.status === 'completed' && !isStale && rec.objective != null ? fmt(rec.objective, 2) : '—'}
+                </div>
+                <div className="hero-formula mono text-xs">
+                  J(P) = 1.0·HPWL + 1.0·Congestion
+                </div>
+              </div>
 
-          {/* Metric Cards (Expanded for HPWL, Congestion, and Combined Objective) */}
-          <section className="cards">
-            <div className="card"><span>HPWL{rec && rec.status !== 'completed' ? ' (partial)' : ''}</span><strong>{fmt(rec?.hpwl)}</strong></div>
-            <div className="card"><span>Congestion (C_score)</span><strong>{fmt(rec?.congestion, 3)}</strong></div>
-            <div className="card"><span>Objective J(P)</span><strong>{fmt(rec?.objective, 3)}</strong></div>
-            <div className="card"><span>Status</span><strong>{rec ? <span className={stCls(rec.status)}>{rec.status}</span> : '—'}</strong></div>
-            <div className="card"><span>Progress</span><strong>{rec ? `${rec.step}/${rec.total}` : '—'}</strong>{rec && <div className="bar"><i style={{ width: `${rec.progress * 100}%` }} /></div>}</div>
-            <div className="card"><span>Elapsed (client)</span><strong>{fmtMs(rec?.elapsedMs ?? null)}</strong></div>
-            <div className="card"><span>Legality check</span><strong>{rec?.status === 'completed' ? (issues.length ? <span className="st st-failed">issues</span> : <span className="st st-completed">legal</span>) : '—'}</strong>{issues.length > 0 && <small>{issues.slice(0, 2).join('; ')}</small>}</div>
-            <div className="card"><span>Run ID</span><strong className="mono">{rec?.runId ? rec.runId.slice(0, 8) : '—'}</strong>{rec && <small>seed {rec.seed}</small>}</div>
-          </section>
+              {/* Secondary Metrics Grid */}
+              <div className="metric-tile-grid">
+                <div className="metric-tile">
+                  <span className="tile-label">HPWL (WIRELENGTH)</span>
+                  <strong className="mono">{rec?.status === 'completed' && !isStale ? fmt(rec.hpwl, 1) : '—'}</strong>
+                </div>
+                <div className="metric-tile">
+                  <span className="tile-label">RUDY CONGESTION</span>
+                  <strong className="mono">{rec?.status === 'completed' && !isStale ? fmt(rec.congestion, 3) : '—'}</strong>
+                </div>
+                <div className="metric-tile">
+                  <span className="tile-label">ELAPSED RUNTIME</span>
+                  <strong className="mono">{!isStale ? fmtMs(rec?.elapsedMs ?? null) : '—'}</strong>
+                </div>
+                <div className="metric-tile">
+                  <span className="tile-label">PLACEMENT STEPS</span>
+                  <strong className="mono">{rec && !isStale ? `${rec.step}/${rec.total}` : '—'}</strong>
+                </div>
+              </div>
 
-          {/* ───────── Compare ───────── */}
-          <section className="panel">
-            <div className="panel-head"><h2>Comparison</h2></div>
-            <div className="compare-grid">
-              {allKeys.map((k) => {
-                const r = runs[k]
-                const na = (RL_RE.test(k) && !rlKey) || !isAvail(k)
-                const rRudy = r?.runId ? rudyData[r.runId] : null
-                return (
-                  <article key={k} className={`cmp ${r?.status === 'completed' && r.hpwl === best && finished.length > 1 ? 'best' : ''} ${na ? 'na' : ''}`}>
-                    <header><strong>{algLabel(k)}</strong>{na ? <span className="st st-na">unavailable</span> : <span className={stCls(r?.status ?? 'idle')}>{r?.status ?? 'not run'}</span>}</header>
-                    {na ? (
-                      <p className="hint">{RL_RE.test(k) ? 'Not registered in the backend registry (src/placement/jobs.py), so no RL result is shown.' : 'Not registered in the backend.'}</p>
-                    ) : r ? (
-                      <>
-                        <Floorplan
-                          nl={r.netlist}
-                          placement={r.placement}
-                          showGrid={showGrid}
-                          showNets={false}
-                          showLabels={showLabels}
-                          showHeatmap={showHeatmap}
-                          rudy={rRudy}
-                          compact
-                        />
-                        <div className="cmp-meta">
-                          <span>HPWL</span><strong>{r.status === 'completed' ? fmt(r.hpwl) : '—'}</strong>
-                        </div>
-                        <div className="cmp-meta">
-                          <span>Congestion</span><strong>{r.status === 'completed' ? fmt(r.congestion, 2) : '—'}</strong>
-                        </div>
-                        <div className="cmp-meta">
-                          <span>Objective</span><strong>{r.status === 'completed' ? fmt(r.objective, 2) : '—'}</strong>
-                        </div>
-                        {r.trace.length > 1 && (
-                          <ConvergenceChart trace={r.trace} totalSteps={r.total} compact />
-                        )}
-                        {r.status === 'failed' && <p className="err-text">{r.error}</p>}
-                        <button className="btn sm" onClick={() => setView(k)}>View large</button>
-                      </>
-                    ) : <p className="hint">Not run yet — press Compare.</p>}
-                  </article>
-                )
-              })}
-            </div>
-
-            <div className="table-wrap">
-              <table className="metrics">
-                <thead>
-                  <tr>
-                    <th>Algorithm</th>
-                    <th>Status</th>
-                    <th className="num">HPWL</th>
-                    <th className="num">Congestion</th>
-                    <th className="num">Objective J(P)</th>
-                    <th className="num">vs best</th>
-                    <th className="num">Steps</th>
-                    <th className="num">Elapsed</th>
-                    <th>Run ID</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {allKeys.map((k) => {
-                    const r = runs[k]
-                    const na = (RL_RE.test(k) && !rlKey) || !isAvail(k)
-                    const ok = r?.status === 'completed' && r.hpwl != null
-                    return (
-                      <tr key={k} className={ok && r.hpwl === best && finished.length > 1 ? 'best' : ''}>
-                        <td>{algLabel(k)}</td>
-                        <td>{na ? <span className="st st-na">unavailable</span> : <span className={stCls(r?.status ?? 'idle')}>{r?.status ?? 'not run'}</span>}</td>
-                        <td className="num">{ok ? fmt(r.hpwl) : '—'}</td>
-                        <td className="num">{ok ? fmt(r.congestion, 3) : '—'}</td>
-                        <td className="num">{ok ? fmt(r.objective, 3) : '—'}</td>
-                        <td className="num">{ok && best != null && best > 0 ? (r.hpwl === best ? 'best' : `+${(((r.hpwl as number) / best - 1) * 100).toFixed(1)}%`) : '—'}</td>
-                        <td className="num">{r ? `${r.step}/${r.total}` : '—'}</td>
-                        <td className="num">{fmtMs(r?.elapsedMs ?? null)}</td>
-                        <td className="mono">{r?.runId?.slice(0, 8) ?? '—'}</td>
-                      </tr>
+              {/* Legality Verification Card */}
+              <div className="legality-card">
+                <div className="legality-header">
+                  <span>LEGALITY VERIFICATION</span>
+                  {rec?.status === 'completed' && !isStale ? (
+                    issues.length === 0 ? (
+                      <span className="badge badge-ok">✓ LEGAL PLACEMENT</span>
+                    ) : (
+                      <span className="badge badge-err">⚠ {issues.length} ISSUE(S)</span>
                     )
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <p className="hint">All metrics (HPWL, RUDY Congestion score, and combined objective J(P) = α·HPWL + β·C_score) are computed via canonical PlacementEngine objectives.</p>
-          </section>
+                  ) : (
+                    <span className="badge badge-muted">AWAITING RUN</span>
+                  )}
+                </div>
+                {rec?.status === 'completed' && !isStale && issues.length === 0 && (
+                  <p className="legality-desc text-ok">
+                    All {rec.placement.length} macros strictly contained within chip boundaries without overlapping.
+                  </p>
+                )}
+                {rec?.status === 'completed' && !isStale && issues.length > 0 && (
+                  <ul className="issues-list mono text-xs">
+                    {issues.slice(0, 3).map((iss, i) => (
+                      <li key={i}>{iss}</li>
+                    ))}
+                  </ul>
+                )}
+                {(!rec || rec.status !== 'completed' || isStale) && (
+                  <p className="hint" style={{ fontSize: '11px', marginTop: '4px' }}>
+                    {isStale
+                      ? 'Awaiting run for current configuration.'
+                      : 'Awaiting placement run to verify boundary constraints and macro overlap.'}
+                  </p>
+                )}
+              </div>
+            </section>
 
-          {/* ───────── Export ───────── */}
-          <section className="panel">
-            <div className="panel-head"><h2>Export</h2></div>
-            <div className="btn-row">
-              <button className="btn" disabled={!hasRuns} onClick={exportJson}>Results · JSON</button>
-              <button className="btn" disabled={!exportable.length} onClick={exportPlacementsCsv}>Placements · CSV</button>
-              <button className="btn" disabled={!hasRuns} onClick={exportMetricsCsv}>Metrics · CSV</button>
-            </div>
-            <p className="hint">{hasRuns ? `${exportable.length} completed run(s) available.` : 'Run an algorithm to enable exports.'}</p>
-          </section>
+            {/* Interactive Macro Inspector */}
+            <section className="eda-panel flex-1">
+              <div className="panel-title">
+                <span>MACRO INSPECTOR</span>
+                {selectedMacro && (
+                  <button className="btn btn-xs" onClick={() => setSelectedMacroId(null)}>✕ Deselect</button>
+                )}
+              </div>
 
-          {/* ───────── Backend history ───────── */}
-          <section className="panel">
-            <div className="panel-head"><h2>Backend run history</h2><button className="btn sm" onClick={() => void loadHistory()}>{history ? 'Refresh' : 'Load'}</button></div>
-            {histErr && <p className="err-text">{histErr}</p>}
-            {history && (history.length === 0 ? <p className="hint">The backend has no runs yet.</p> : (
-              <div className="table-wrap"><table className="metrics">
-                <thead><tr><th>Run ID</th><th>Status</th><th className="num">Progress</th><th className="num">HPWL</th><th className="num">Placed</th></tr></thead>
-                <tbody>{history.map((h) => (
-                  <tr key={h.run_id}><td className="mono">{h.run_id.slice(0, 8)}</td><td><span className={stCls(h.status)}>{h.status}</span></td>
-                    <td className="num">{Math.round(h.progress * 100)}%</td><td className="num">{fmt(h.current_hpwl)}</td><td className="num">{h.placement.length}</td></tr>
-                ))}</tbody>
-              </table></div>
-            ))}
+              {selectedMacro ? (
+                <div className="inspector-content">
+                  <div className="inspector-head">
+                    <span className="inspector-badge mono font-bold">M{selectedMacro.macro?.id}</span>
+                    <span className="mono text-xs">{selectedMacro.macro?.w} × {selectedMacro.macro?.h} units</span>
+                  </div>
+
+                  <div className="inspector-fields">
+                    <div className="insp-row">
+                      <span>Coordinates (X, Y)</span>
+                      <strong className="mono text-accent">
+                        {selectedMacro.placed ? `(${selectedMacro.placed.x}, ${selectedMacro.placed.y})` : 'Unplaced'}
+                      </strong>
+                    </div>
+                    <div className="insp-row">
+                      <span>Dimensions (W × H)</span>
+                      <strong className="mono">{selectedMacro.macro?.w} × {selectedMacro.macro?.h}</strong>
+                    </div>
+                    <div className="insp-row">
+                      <span>Boundary Check</span>
+                      <span className={`badge ${selectedMacro.isOutOfBounds ? 'badge-err' : 'badge-ok'}`}>
+                        {selectedMacro.isOutOfBounds ? 'Out of bounds' : 'Within Canvas'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="insp-nets-box">
+                    <span className="insp-subhead">CONNECTED NETS ({selectedMacro.connectedNets.length})</span>
+                    <div className="insp-nets-list">
+                      {selectedMacro.connectedNets.map((n) => (
+                        <div key={n.id} className="insp-net-item mono text-xs">
+                          <span className="text-accent">Net {n.id}</span>
+                          <span>wt: {n.weight}</span>
+                          <span className="text-muted">peers: [{n.macro_ids.filter((id) => id !== selectedMacroId).join(', ')}]</span>
+                        </div>
+                      ))}
+                      {selectedMacro.connectedNets.length === 0 && (
+                        <p className="hint">No nets attached to this macro.</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="inspector-placeholder">
+                  <p className="hint">
+                    Click any macro on the floorplan to inspect coordinates, dimensions, connected nets, and boundary legality.
+                  </p>
+                </div>
+              )}
+            </section>
+          </aside>
+
+          {/* ────── Bottom Section: Analysis, Trace & Comparison ────── */}
+          <section className="eda-bottom-drawer">
+            <div className="drawer-header">
+              <div className="drawer-tabs">
+                <button
+                  className={`drawer-tab ${bottomTab === 'convergence' ? 'active' : ''}`}
+                  onClick={() => setBottomTab('convergence')}
+                >
+                  Convergence Curve
+                </button>
+                <button
+                  className={`drawer-tab ${bottomTab === 'comparison' ? 'active' : ''}`}
+                  onClick={() => setBottomTab('comparison')}
+                >
+                  Algorithm Comparison ({currentFinished.length})
+                </button>
+                <button
+                  className={`drawer-tab ${bottomTab === 'history' ? 'active' : ''}`}
+                  onClick={() => { setBottomTab('history'); void loadHistory() }}
+                >
+                  Backend Run History
+                </button>
+                <button
+                  className={`drawer-tab ${bottomTab === 'export' ? 'active' : ''}`}
+                  onClick={() => setBottomTab('export')}
+                >
+                  Export Center
+                </button>
+              </div>
+
+              {rec?.runId && !isStale && (
+                <div className="mono text-xs text-muted">
+                  Active Run: <span className="text-accent">{rec.runId.slice(0, 8)}</span> (Seed {rec.seed})
+                </div>
+              )}
+            </div>
+
+            <div className="drawer-body">
+              {/* Convergence Tab */}
+              {bottomTab === 'convergence' && (
+                <div className="drawer-pane">
+                  {!isStale && rec?.trace && rec.trace.length > 1 ? (
+                    <ConvergenceChart trace={rec.trace} totalSteps={rec.total} />
+                  ) : (
+                    <p className="hint">
+                      {isStale
+                        ? `Configuration changed. Run ${algLabel(alg)} to generate a new convergence curve for the current netlist.`
+                        : 'Run an optimization algorithm (Greedy, SA, or Random) to generate a step-by-step convergence curve.'}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Comparison Tab */}
+              {bottomTab === 'comparison' && (
+                <div className="drawer-pane">
+                  <div className="compare-mini-cards">
+                    {allKeys.map((k) => {
+                      const r = runs[k]
+                      const na = (RL_RE.test(k) && !rlKey) || !isAvail(k)
+                      const isCurrent = isRunCurrent(r)
+                      const isOk = isCurrent && r?.status === 'completed'
+                      const isBest = isOk && (r.objective ?? r.hpwl) === bestObj && currentFinished.length > 1
+                      return (
+                        <div key={k} className={`compare-card ${isBest ? 'best' : ''} ${na ? 'na' : ''}`}>
+                          <div className="cmp-head">
+                            <strong className="mono">{algLabel(k)}</strong>
+                            {na ? (
+                              <span className="badge badge-muted">Unavailable</span>
+                            ) : !isCurrent && r ? (
+                              <span className="badge badge-muted">stale config</span>
+                            ) : (
+                              <span className={`st ${stCls(r?.status ?? 'idle')}`}>{r?.status ?? 'idle'}</span>
+                            )}
+                          </div>
+                          <div className="cmp-metrics mono">
+                            <div><span>Objective J(P):</span> <strong>{isOk ? fmt(r.objective) : '—'}</strong></div>
+                            <div><span>HPWL:</span> <strong>{isOk ? fmt(r.hpwl) : '—'}</strong></div>
+                            <div><span>Congestion:</span> <strong>{isOk ? fmt(r.congestion, 3) : '—'}</strong></div>
+                            <div><span>Time:</span> <strong>{isCurrent ? fmtMs(r?.elapsedMs ?? null) : '—'}</strong></div>
+                          </div>
+                          {isBest && <span className="badge badge-ok font-bold">★ Lowest Objective</span>}
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  <div className="table-wrap" style={{ marginTop: '12px' }}>
+                    <table className="metrics">
+                      <thead>
+                        <tr>
+                          <th>Algorithm</th>
+                          <th>Status</th>
+                          <th className="num">HPWL</th>
+                          <th className="num">Congestion</th>
+                          <th className="num">Objective J(P)</th>
+                          <th className="num">vs Best</th>
+                          <th className="num">Steps</th>
+                          <th className="num">Elapsed</th>
+                          <th>Run ID</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allKeys.map((k) => {
+                          const r = runs[k]
+                          const na = (RL_RE.test(k) && !rlKey) || !isAvail(k)
+                          const isCurrent = isRunCurrent(r)
+                          const ok = isCurrent && r?.status === 'completed' && r.hpwl != null
+                          const currentVal = r?.objective ?? r?.hpwl
+                          const isBest = ok && currentVal === bestObj && currentFinished.length > 1
+                          return (
+                            <tr key={k} className={isBest ? 'best' : ''}>
+                              <td className="font-bold">{algLabel(k)}</td>
+                              <td>
+                                {na ? (
+                                  <span className="st st-na">unavailable</span>
+                                ) : !isCurrent && r ? (
+                                  <span className="badge badge-muted">stale config</span>
+                                ) : (
+                                  <span className={stCls(r?.status ?? 'idle')}>{r?.status ?? 'not run'}</span>
+                                )}
+                              </td>
+                              <td className="num">{ok ? fmt(r.hpwl) : '—'}</td>
+                              <td className="num">{ok ? fmt(r.congestion, 3) : '—'}</td>
+                              <td className="num font-bold text-accent">{ok ? fmt(r.objective, 2) : '—'}</td>
+                              <td className="num font-bold">
+                                {ok && bestObj != null && currentVal != null && currentVal > 0
+                                  ? (currentVal === bestObj ? 'Best' : `+${(((currentVal / bestObj) - 1) * 100).toFixed(1)}%`)
+                                  : '—'}
+                              </td>
+                              <td className="num">{isCurrent && r ? `${r.step}/${r.total}` : '—'}</td>
+                              <td className="num">{isCurrent ? fmtMs(r?.elapsedMs ?? null) : '—'}</td>
+                              <td className="mono">{isCurrent ? (r?.runId?.slice(0, 8) ?? '—') : '—'}</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* History Tab */}
+              {bottomTab === 'history' && (
+                <div className="drawer-pane">
+                  {histErr && <p className="notice-error-box">{histErr}</p>}
+                  {history && (history.length === 0 ? <p className="hint">No server placements found.</p> : (
+                    <div className="table-wrap">
+                      <table className="metrics">
+                        <thead>
+                          <tr>
+                            <th>Run ID</th>
+                            <th>Status</th>
+                            <th className="num">Progress</th>
+                            <th className="num">HPWL</th>
+                            <th className="num">Congestion</th>
+                            <th className="num">Objective</th>
+                            <th className="num">Macros Placed</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {history.map((h) => (
+                            <tr key={h.run_id}>
+                              <td className="mono">{h.run_id.slice(0, 8)}</td>
+                              <td><span className={stCls(h.status)}>{h.status}</span></td>
+                              <td className="num">{Math.round(h.progress * 100)}%</td>
+                              <td className="num">{fmt(h.current_hpwl)}</td>
+                              <td className="num">{fmt(h.current_congestion, 3)}</td>
+                              <td className="num font-bold text-accent">{fmt(h.current_objective, 2)}</td>
+                              <td className="num">{h.placement.length}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Export Tab */}
+              {bottomTab === 'export' && (
+                <div className="drawer-pane">
+                  <p className="hint">Export verified placements, runtime metrics, or complete circuit netlists in standard exchange formats:</p>
+                  <div className="btn-action-row" style={{ marginTop: '10px' }}>
+                    <button className="btn" disabled={!hasRuns} onClick={exportJson}>Results · JSON</button>
+                    <button className="btn" disabled={!exportable.length} onClick={exportPlacementsCsv}>Placements · CSV</button>
+                    <button className="btn" disabled={!hasRuns} onClick={exportMetricsCsv}>Metrics · CSV</button>
+                    <button className="btn" onClick={exportNetlist}>Circuit Netlist · JSON</button>
+                  </div>
+                  <span className="mono text-xs text-muted" style={{ display: 'block', marginTop: '10px' }}>
+                    {exportable.length} completed run(s) ready for export.
+                  </span>
+                </div>
+              )}
+            </div>
           </section>
-        </main>
-      </div>
+        </div>
+      ) : (
+        <ExperimentsView apiUrl={base} />
+      )}
     </div>
   )
 }
